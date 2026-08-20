@@ -1,5 +1,7 @@
-flask
+Flask
 flask-cors
+flask-socketio
 bcrypt
-pyjwt
+PyJWT
 gunicorn
+eventlet
