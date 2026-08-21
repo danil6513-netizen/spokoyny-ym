@@ -1,6 +1,8 @@
 Flask
 flask-cors
 flask-socketio
-gunicorn
 bcrypt
 PyJWT
+gunicorn
+eventlet
+psycopg2-binary
