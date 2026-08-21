@@ -1623,40 +1623,39 @@ def send_message():
             # -------------------------------------------------
             # 3. INSERT.
             #
-            # Если в старой базе есть chat_id — передаём его.
-            # Если его нет — используем новую схему.
+            # В базе может остаться старая схема messages с
+            # обязательными колонками from_user / to_user.
+            # Поэтому добавляем их автоматически, если они есть.
             # -------------------------------------------------
 
+            insert_columns = ["sender_id", "receiver_id", "content"]
+            insert_values = [user[0], receiver_id, content]
+
+            # Старые версии базы могли требовать from_user/to_user.
+            # Передаём туда ID пользователей.
+            if "from_user" in columns:
+                insert_columns.append("from_user")
+                insert_values.append(user[0])
+
+            if "to_user" in columns:
+                insert_columns.append("to_user")
+                insert_values.append(receiver_id)
+
             if "chat_id" in columns and chat_id is not None:
-                cur.execute("""
-                    INSERT INTO messages (
-                        sender_id,
-                        receiver_id,
-                        content,
-                        chat_id
-                    )
-                    VALUES (%s, %s, %s, %s)
+                insert_columns.append("chat_id")
+                insert_values.append(chat_id)
+
+            placeholders = ", ".join(["%s"] * len(insert_values))
+            column_sql = ", ".join(insert_columns)
+
+            cur.execute(
+                f"""
+                    INSERT INTO messages ({column_sql})
+                    VALUES ({placeholders})
                     RETURNING id, created_at
-                """, (
-                    user[0],
-                    receiver_id,
-                    content,
-                    chat_id
-                ))
-            else:
-                cur.execute("""
-                    INSERT INTO messages (
-                        sender_id,
-                        receiver_id,
-                        content
-                    )
-                    VALUES (%s, %s, %s)
-                    RETURNING id, created_at
-                """, (
-                    user[0],
-                    receiver_id,
-                    content
-                ))
+                """,
+                tuple(insert_values)
+            )
 
             row = cur.fetchone()
 
