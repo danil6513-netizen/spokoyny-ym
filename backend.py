@@ -1424,322 +1424,243 @@ def get_messages():
 
 @app.route("/api/messages", methods=["POST"])
 def send_message():
-    """
-    Отправка сообщения.
-
-    Важный момент:
-    старая PostgreSQL-схема могла содержать chat_id в messages.
-    Поэтому перед INSERT мы создаём/находим чат и проверяем,
-    существует ли колонка chat_id. Это позволяет работать и со
-    старой, и с новой схемой базы без удаления данных.
-    """
-
+    """Надёжная отправка сообщения для старой и новой схемы PostgreSQL."""
     user = get_user_by_token()
-
     if not user:
         return unauthorized()
 
     data = request.get_json(silent=True) or {}
 
     try:
-        # =================================================
-        # ПОЛУЧАТЕЛЬ
-        # =================================================
-
+        # Получатель
         receiver_id = (
-            data.get("receiver_id")
-            or data.get("receiverId")
-            or data.get("recipient_id")
-            or data.get("recipientId")
-            or data.get("user_id")
-            or data.get("userId")
+            data.get("receiver_id") or data.get("receiverId") or
+            data.get("recipient_id") or data.get("recipientId") or
+            data.get("user_id") or data.get("userId")
         )
 
-        to_user = (
-            data.get("to_user")
-            or data.get("toUser")
-            or data.get("username")
+        username_target = (
+            data.get("to_user") or data.get("toUser") or
+            data.get("username")
         )
 
-        if not receiver_id and to_user:
-            target = get_user_by_username(str(to_user).strip())
-
+        if not receiver_id and username_target:
+            target = get_user_by_username(str(username_target).strip())
             if not target:
-                return jsonify({
-                    "success": False,
-                    "message": "Получатель не найден"
-                }), 404
-
+                return jsonify({"success": False, "message": "Получатель не найден"}), 404
             receiver_id = target[0]
 
         if receiver_id is None or str(receiver_id).strip() == "":
-            return jsonify({
-                "success": False,
-                "message": "Не указан получатель"
-            }), 400
+            return jsonify({"success": False, "message": "Не указан получатель"}), 400
 
         try:
             receiver_id = int(receiver_id)
         except (ValueError, TypeError):
-            return jsonify({
-                "success": False,
-                "message": "Неверный ID получателя"
-            }), 400
+            return jsonify({"success": False, "message": "Неверный ID получателя"}), 400
 
-        # =================================================
-        # ТЕКСТ
-        # =================================================
-
-        content = (
-            data.get("content")
-            or data.get("text")
-            or data.get("message")
-            or ""
-        )
-
-        content = str(content).strip()
+        content = data.get("content")
+        if content is None:
+            content = data.get("text")
+        if content is None:
+            content = data.get("message")
+        content = str(content or "").strip()
 
         if not content:
-            return jsonify({
-                "success": False,
-                "message": "Введите сообщение"
-            }), 400
-
+            return jsonify({"success": False, "message": "Введите сообщение"}), 400
         if len(content) > 5000:
-            return jsonify({
-                "success": False,
-                "message": "Сообщение слишком длинное"
-            }), 400
-
+            return jsonify({"success": False, "message": "Сообщение слишком длинное"}), 400
         if receiver_id == user[0]:
-            return jsonify({
-                "success": False,
-                "message": "Нельзя отправить сообщение самому себе"
-            }), 400
-
-        # =================================================
-        # ПРОВЕРКА ПОЛУЧАТЕЛЯ
-        # =================================================
+            return jsonify({"success": False, "message": "Нельзя отправить сообщение самому себе"}), 400
 
         receiver = get_user_by_id(receiver_id)
-
         if not receiver:
-            return jsonify({
-                "success": False,
-                "message": "Получатель не найден"
-            }), 404
-
-        # =================================================
-        # DATABASE
-        # =================================================
+            return jsonify({"success": False, "message": "Получатель не найден"}), 404
 
         conn = get_db()
         cur = conn.cursor()
 
         try:
-            # -------------------------------------------------
-            # 1. Находим или создаём чат ПЕРЕД сообщением.
-            # -------------------------------------------------
-
+            # Находим/создаём чат. Если старая таблица chats несовместима,
+            # сообщение всё равно пытаемся сохранить без chat_id.
             chat_id = None
-
             try:
                 cur.execute("""
-                    SELECT id
-                    FROM chats
-                    WHERE
-                        (
-                            user1_id = %s
-                            AND user2_id = %s
-                        )
-                        OR
-                        (
-                            user1_id = %s
-                            AND user2_id = %s
-                        )
+                    SELECT id FROM chats
+                    WHERE (user1_id = %s AND user2_id = %s)
+                       OR (user1_id = %s AND user2_id = %s)
                     LIMIT 1
-                """, (
-                    user[0],
-                    receiver_id,
-                    receiver_id,
-                    user[0]
-                ))
+                """, (user[0], receiver_id, receiver_id, user[0]))
+                row = cur.fetchone()
 
-                chat = cur.fetchone()
-
-                if chat:
-                    chat_id = chat[0]
+                if row:
+                    chat_id = row[0]
                 else:
                     cur.execute("""
-                        INSERT INTO chats (
-                            user1_id,
-                            user2_id
-                        )
+                        INSERT INTO chats (user1_id, user2_id)
                         VALUES (%s, %s)
                         RETURNING id
-                    """, (
-                        user[0],
-                        receiver_id
-                    ))
-
-                    chat_row = cur.fetchone()
-
-                    if chat_row:
-                        chat_id = chat_row[0]
-
+                    """, (user[0], receiver_id))
+                    row = cur.fetchone()
+                    chat_id = row[0] if row else None
             except Exception as chat_error:
-                # Если старая таблица chats отличается от новой,
-                # не ломаем отправку сообщения.
-                print("CHAT CREATE ERROR:")
-                print(repr(chat_error))
+                print("CHAT CREATE ERROR:", repr(chat_error))
                 traceback.print_exc()
                 conn.rollback()
 
-                # Начинаем транзакцию заново.
-                cur.close()
-                conn.close()
+            # Получаем РЕАЛЬНУЮ структуру messages.
+            cur.execute("""
+                SELECT
+                    column_name,
+                    is_nullable,
+                    column_default,
+                    data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'messages'
+                ORDER BY ordinal_position
+            """)
+            schema_rows = cur.fetchall()
 
-                conn = get_db()
-                cur = conn.cursor()
+            if not schema_rows:
+                raise RuntimeError("Таблица messages не найдена")
 
-                chat_id = None
+            schema = {
+                row[0]: {
+                    "nullable": row[1] == "YES",
+                    "default": row[2],
+                    "type": row[3]
+                }
+                for row in schema_rows
+            }
 
-            # -------------------------------------------------
-            # 2. Проверяем структуру messages.
-            # -------------------------------------------------
+            # Значения для всех распространённых вариантов старой/новой схемы.
+            values_by_name = {
+                "sender_id": user[0],
+                "receiver_id": receiver_id,
+                "from_user": user[0],
+                "to_user": receiver_id,
+                "content": content,
+                "text": content,
+                "message": content,
+                "chat_id": chat_id,
+                "sender": user[0],
+                "receiver": receiver_id,
+                "user_id": user[0],
+                "created_at": None,
+                "timestamp": None
+            }
 
-            columns = table_columns(cur, "messages")
+            insert_columns = []
+            insert_values = []
 
-            required = {"sender_id", "receiver_id", "content"}
+            # Заполняем только реально существующие колонки.
+            # Колонки с DEFAULT можно не передавать.
+            for column_name, meta in schema.items():
+                if column_name == "id":
+                    continue
 
-            missing = required - columns
+                if column_name in values_by_name:
+                    value = values_by_name[column_name]
 
-            if missing:
+                    # created_at/timestamp с DEFAULT оставляем БД.
+                    if value is None and meta["default"] is not None:
+                        continue
+
+                    # chat_id не вставляем, если чата нет.
+                    if column_name == "chat_id" and value is None:
+                        if not meta["nullable"] and meta["default"] is None:
+                            raise RuntimeError("В messages обязательный chat_id, но чат создать не удалось")
+                        continue
+
+                    # created_at/timestamp без DEFAULT лучше не трогать:
+                    # PostgreSQL сам сообщит, если такая схема несовместима.
+                    if column_name in ("created_at", "timestamp") and value is None:
+                        if meta["nullable"] or meta["default"] is not None:
+                            continue
+
+                    insert_columns.append(column_name)
+                    insert_values.append(value)
+
+            # Проверяем обязательные поля старой таблицы.
+            missing_required = []
+            for column_name, meta in schema.items():
+                if column_name == "id":
+                    continue
+                if not meta["nullable"] and meta["default"] is None:
+                    if column_name not in insert_columns:
+                        missing_required.append(column_name)
+
+            if missing_required:
                 raise RuntimeError(
-                    "В таблице messages отсутствуют колонки: "
-                    + ", ".join(sorted(missing))
+                    "В messages есть обязательные поля без значения: " +
+                    ", ".join(missing_required)
                 )
 
-            # -------------------------------------------------
-            # 3. INSERT.
-            #
-            # В базе может остаться старая схема messages с
-            # обязательными колонками from_user / to_user.
-            # Поэтому добавляем их автоматически, если они есть.
-            # -------------------------------------------------
-
-            insert_columns = ["sender_id", "receiver_id", "content"]
-            insert_values = [user[0], receiver_id, content]
-
-            # Старые версии базы могли требовать from_user/to_user.
-            # Передаём туда ID пользователей.
-            if "from_user" in columns:
-                insert_columns.append("from_user")
-                insert_values.append(user[0])
-
-            if "to_user" in columns:
-                insert_columns.append("to_user")
-                insert_values.append(receiver_id)
-
-            if "chat_id" in columns and chat_id is not None:
-                insert_columns.append("chat_id")
-                insert_values.append(chat_id)
+            if not insert_columns:
+                raise RuntimeError("Не найдено ни одного поля для INSERT в messages")
 
             placeholders = ", ".join(["%s"] * len(insert_values))
-            column_sql = ", ".join(insert_columns)
+            columns_sql = ", ".join(f'"{c}"' for c in insert_columns)
 
+            # id гарантированно есть в нормальной таблице messages.
             cur.execute(
-                f"""
-                    INSERT INTO messages ({column_sql})
-                    VALUES ({placeholders})
-                    RETURNING id, created_at
-                """,
+                f'INSERT INTO messages ({columns_sql}) VALUES ({placeholders}) RETURNING id',
                 tuple(insert_values)
             )
-
             row = cur.fetchone()
-
             if not row:
-                raise RuntimeError(
-                    "Не удалось создать сообщение"
-                )
+                raise RuntimeError("PostgreSQL не вернул ID сообщения")
 
             message_id = row[0]
-            created_at = row[1]
+
+            # Получаем дату уже созданной записи, если поле есть.
+            created_at = None
+            if "created_at" in schema:
+                cur.execute('SELECT "created_at" FROM messages WHERE id = %s', (message_id,))
+                created_row = cur.fetchone()
+                if created_row:
+                    created_at = created_row[0]
 
             conn.commit()
 
         except Exception as e:
             conn.rollback()
-
-            print("")
-            print("===================================")
+            print("\n===================================")
             print("SEND MESSAGE DATABASE ERROR")
             print("TYPE:", type(e).__name__)
             print("ERROR:", str(e))
             print("REPR:", repr(e))
             print("===================================")
             traceback.print_exc()
-
             raise
-
         finally:
             cur.close()
             conn.close()
 
-        # =================================================
-        # ОБЪЕКТ СООБЩЕНИЯ
-        # =================================================
-
         message = {
             "id": message_id,
             "chat_id": chat_id,
-
             "sender_id": user[0],
             "sender_username": user[1],
             "sender_display_name": user[2] or user[1],
-
             "receiver_id": receiver[0],
             "receiver_username": receiver[1],
             "receiver_display_name": receiver[2] or receiver[1],
-
             "content": content,
-
-            "created_at": (
-                created_at.isoformat()
-                if created_at
-                else None
-            )
+            "text": content,
+            "created_at": created_at.isoformat() if created_at else None
         }
 
-        # =================================================
-        # SOCKET.IO
-        # =================================================
-
         try:
-            socketio.emit(
-                "new_message",
-                message,
-                room=receiver[1]
-            )
+            socketio.emit("new_message", message, room=receiver[1])
+            socketio.emit("message_sent", message, room=user[1])
+        except Exception as socket_error:
+            print("SOCKET MESSAGE ERROR:", repr(socket_error))
 
-            socketio.emit(
-                "message_sent",
-                message,
-                room=user[1]
-            )
-
-        except Exception as e:
-            print("SOCKET MESSAGE ERROR:", repr(e))
-
-        return jsonify({
-            "success": True,
-            "message": message
-        }), 200
+        return jsonify({"success": True, "message": message}), 200
 
     except Exception as e:
-        print("")
-        print("===================================")
+        print("\n===================================")
         print("SEND MESSAGE FATAL ERROR")
         print("TYPE:", type(e).__name__)
         print("ERROR:", str(e))
@@ -1752,11 +1673,6 @@ def send_message():
             "message": "Ошибка отправки сообщения",
             "error": str(e)
         }), 500
-
-
-# =========================================================
-# MOOD GET
-# =========================================================
 
 @app.route("/api/mood", methods=["GET"])
 def get_my_mood():
