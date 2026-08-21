@@ -8,6 +8,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit, join_room
 
+
 # =========================================================
 # CONFIG
 # =========================================================
@@ -21,11 +22,13 @@ SECRET_KEY = os.environ.get(
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
+
 CORS(
     app,
     resources={r"/api/*": {"origins": "*"}},
     supports_credentials=True
 )
+
 
 socketio = SocketIO(
     app,
@@ -39,6 +42,7 @@ socketio = SocketIO(
 # =========================================================
 
 def get_db():
+
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL не задан")
 
@@ -46,8 +50,13 @@ def get_db():
 
 
 def init_db():
+
     conn = get_db()
     cur = conn.cursor()
+
+    # -----------------------------------------------------
+    # USERS
+    # -----------------------------------------------------
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -61,6 +70,11 @@ def init_db():
         )
     """)
 
+
+    # -----------------------------------------------------
+    # FAILED ATTEMPTS
+    # -----------------------------------------------------
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS failed_attempts (
             ip TEXT PRIMARY KEY,
@@ -69,67 +83,145 @@ def init_db():
         )
     """)
 
+
+    # -----------------------------------------------------
+    # POSTS
+    # -----------------------------------------------------
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS posts (
             id SERIAL PRIMARY KEY,
             user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            content TEXT NOT NULL,
+            content TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # ВАЖНО:
+    # Если таблица posts уже существовала раньше,
+    # CREATE TABLE IF NOT EXISTS её НЕ меняет.
+    # Поэтому добавляем отсутствующие колонки отдельно.
+
+    cur.execute("""
+        ALTER TABLE posts
+        ADD COLUMN IF NOT EXISTS content TEXT
+    """)
+
+    cur.execute("""
+        ALTER TABLE posts
+        ADD COLUMN IF NOT EXISTS created_at
+        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    """)
+
+
+    # -----------------------------------------------------
+    # LIKES
+    # -----------------------------------------------------
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS likes (
             id SERIAL PRIMARY KEY,
-            post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
-            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            post_id INTEGER
+                REFERENCES posts(id)
+                ON DELETE CASCADE,
+
+            user_id INTEGER
+                REFERENCES users(id)
+                ON DELETE CASCADE,
+
             UNIQUE(post_id, user_id)
         )
     """)
 
+
+    # -----------------------------------------------------
+    # CHATS
+    # -----------------------------------------------------
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS chats (
             id SERIAL PRIMARY KEY,
-            user1_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            user2_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+
+            user1_id INTEGER
+                REFERENCES users(id)
+                ON DELETE CASCADE,
+
+            user2_id INTEGER
+                REFERENCES users(id)
+                ON DELETE CASCADE,
+
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+
+    # -----------------------------------------------------
+    # MESSAGES
+    # -----------------------------------------------------
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id SERIAL PRIMARY KEY,
-            sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            receiver_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+
+            sender_id INTEGER
+                REFERENCES users(id)
+                ON DELETE CASCADE,
+
+            receiver_id INTEGER
+                REFERENCES users(id)
+                ON DELETE CASCADE,
+
             content TEXT NOT NULL,
+
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+
+    # -----------------------------------------------------
+    # MOODS
+    # -----------------------------------------------------
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS moods (
             id SERIAL PRIMARY KEY,
-            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+
+            user_id INTEGER
+                REFERENCES users(id)
+                ON DELETE CASCADE,
+
             mood TEXT NOT NULL,
+
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
+
+    # -----------------------------------------------------
+    # GRATITUDE
+    # -----------------------------------------------------
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS gratitude (
             id SERIAL PRIMARY KEY,
-            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+
+            user_id INTEGER
+                REFERENCES users(id)
+                ON DELETE CASCADE,
+
             content TEXT NOT NULL,
+
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
 
     conn.commit()
 
     cur.close()
     conn.close()
 
-    print("✅ DATABASE INITIALIZED")
+    print("DATABASE INITIALIZED")
 
 
 # =========================================================
@@ -137,11 +229,17 @@ def init_db():
 # =========================================================
 
 def get_json():
-    return request.get_json(silent=True) or {}
+
+    return request.get_json(
+        silent=True
+    ) or {}
 
 
 def normalize(value):
-    return str(value or "").strip().lower()
+
+    return str(
+        value or ""
+    ).strip().lower()
 
 
 # =========================================================
@@ -149,6 +247,7 @@ def normalize(value):
 # =========================================================
 
 def hash_password(password):
+
     return bcrypt.hashpw(
         password.encode("utf-8"),
         bcrypt.gensalt()
@@ -157,16 +256,30 @@ def hash_password(password):
 
 def check_password(password, stored_hash):
 
-    # PostgreSQL BYTEA иногда возвращает memoryview.
-    # bcrypt требует bytes.
-    if isinstance(stored_hash, memoryview):
+    # PostgreSQL BYTEA может возвращать memoryview.
+    # bcrypt принимает bytes.
+
+    if isinstance(
+        stored_hash,
+        memoryview
+    ):
         stored_hash = stored_hash.tobytes()
 
-    elif isinstance(stored_hash, bytearray):
-        stored_hash = bytes(stored_hash)
+    elif isinstance(
+        stored_hash,
+        bytearray
+    ):
+        stored_hash = bytes(
+            stored_hash
+        )
 
-    elif isinstance(stored_hash, str):
-        stored_hash = stored_hash.encode("utf-8")
+    elif isinstance(
+        stored_hash,
+        str
+    ):
+        stored_hash = stored_hash.encode(
+            "utf-8"
+        )
 
     return bcrypt.checkpw(
         password.encode("utf-8"),
@@ -178,28 +291,46 @@ def check_password(password, stored_hash):
 # JWT
 # =========================================================
 
-def create_token(user_id, username):
+def create_token(
+    user_id,
+    username
+):
+
+    now = datetime.datetime.now(
+        datetime.timezone.utc
+    )
 
     return jwt.encode(
         {
             "user_id": user_id,
             "username": username,
-            "exp": datetime.datetime.utcnow()
-                  + datetime.timedelta(days=7)
+
+            "exp":
+                now
+                + datetime.timedelta(
+                    days=7
+                )
         },
+
         SECRET_KEY,
+
         algorithm="HS256"
     )
 
 
 def get_token_from_request():
 
-    auth = request.headers.get("Authorization", "")
+    auth = request.headers.get(
+        "Authorization",
+        ""
+    )
 
     if not auth:
         return None
 
-    if auth.lower().startswith("bearer "):
+    if auth.lower().startswith(
+        "bearer "
+    ):
         return auth[7:].strip()
 
     return auth.strip()
@@ -210,10 +341,19 @@ def get_user_by_token(token):
     try:
 
         if not token:
-            print("❌ JWT: токен пустой")
+
+            print(
+                "JWT: токен пустой"
+            )
+
             return None
 
-        token = token.replace("Bearer ", "").strip()
+
+        token = token.replace(
+            "Bearer ",
+            ""
+        ).strip()
+
 
         data = jwt.decode(
             token,
@@ -221,16 +361,24 @@ def get_user_by_token(token):
             algorithms=["HS256"]
         )
 
-        print("✅ JWT расшифрован")
 
-        user_id = data.get("user_id")
+        user_id = data.get(
+            "user_id"
+        )
+
 
         if not user_id:
-            print("❌ JWT: нет user_id")
+
+            print(
+                "JWT: нет user_id"
+            )
+
             return None
+
 
         conn = get_db()
         cur = conn.cursor()
+
 
         cur.execute("""
             SELECT
@@ -241,42 +389,54 @@ def get_user_by_token(token):
                 role
             FROM users
             WHERE id = %s
-        """, (user_id,))
+        """, (
+            user_id,
+        ))
+
 
         user = cur.fetchone()
+
 
         cur.close()
         conn.close()
 
+
         if not user:
+
             print(
-                f"❌ JWT: пользователь "
+                f"JWT: пользователь "
                 f"id={user_id} не найден"
             )
+
             return None
 
-        print(
-            f"✅ JWT: @{user[1]} найден"
-        )
 
         return user
 
+
     except jwt.ExpiredSignatureError:
 
-        print("❌ JWT: токен истёк")
+        print(
+            "JWT: токен истёк"
+        )
+
         return None
+
 
     except jwt.InvalidTokenError as e:
 
         print(
-            f"❌ JWT: недействительный токен: {e}"
+            f"JWT: недействительный "
+            f"токен: {e}"
         )
+
         return None
+
 
     except Exception as e:
 
         print(
-            f"❌ JWT ERROR: "
+            f"JWT ERROR: "
             f"{type(e).__name__}: {e}"
         )
 
@@ -290,14 +450,20 @@ def auth_user():
     if not token:
         return None
 
-    return get_user_by_token(token)
+    return get_user_by_token(
+        token
+    )
 
 
 def auth_error():
 
     return jsonify({
+
         "success": False,
-        "message": "Токен недействителен"
+
+        "message":
+            "Токен недействителен"
+
     }), 401
 
 
@@ -310,6 +476,7 @@ def get_user_by_email(email):
     conn = get_db()
     cur = conn.cursor()
 
+
     cur.execute("""
         SELECT
             id,
@@ -319,12 +486,17 @@ def get_user_by_email(email):
             email
         FROM users
         WHERE email = %s
-    """, (email,))
+    """, (
+        email,
+    ))
+
 
     user = cur.fetchone()
 
+
     cur.close()
     conn.close()
+
 
     return user
 
@@ -334,9 +506,7 @@ def get_user_by_username(username):
     conn = get_db()
     cur = conn.cursor()
 
-    # ВАЖНО:
-    # email тоже возвращаем.
-    # Поэтому структура результата одинаковая.
+
     cur.execute("""
         SELECT
             id,
@@ -346,24 +516,33 @@ def get_user_by_username(username):
             email
         FROM users
         WHERE username = %s
-    """, (username,))
+    """, (
+        username,
+    ))
+
 
     user = cur.fetchone()
 
+
     cur.close()
     conn.close()
+
 
     return user
 
 
 def get_user_by_login(login):
 
-    user = get_user_by_email(login)
+    user = get_user_by_email(
+        login
+    )
 
     if user:
         return user
 
-    return get_user_by_username(login)
+    return get_user_by_username(
+        login
+    )
 
 
 # =========================================================
@@ -375,32 +554,61 @@ def is_blocked(ip):
     conn = get_db()
     cur = conn.cursor()
 
+
     cur.execute("""
-        SELECT attempts, last_attempt
+        SELECT
+            attempts,
+            last_attempt
         FROM failed_attempts
         WHERE ip = %s
-    """, (ip,))
+    """, (
+        ip,
+    ))
+
 
     row = cur.fetchone()
+
 
     cur.close()
     conn.close()
 
+
     if not row:
         return False
 
+
     attempts, last_attempt = row
+
 
     if attempts < 5:
         return False
 
-    now = datetime.datetime.utcnow()
 
-    if now - last_attempt >= datetime.timedelta(minutes=5):
+    now = datetime.datetime.now(
+        datetime.timezone.utc
+    )
+
+
+    if last_attempt.tzinfo is None:
+
+        last_attempt = (
+            last_attempt.replace(
+                tzinfo=datetime.timezone.utc
+            )
+        )
+
+
+    if (
+        now - last_attempt
+        >= datetime.timedelta(
+            minutes=5
+        )
+    ):
 
         reset_attempts(ip)
 
         return False
+
 
     return True
 
@@ -410,21 +618,39 @@ def record_failed_attempt(ip):
     conn = get_db()
     cur = conn.cursor()
 
+
     cur.execute("""
         INSERT INTO failed_attempts
-            (ip, attempts, last_attempt)
+            (
+                ip,
+                attempts,
+                last_attempt
+            )
+
         VALUES
-            (%s, 1, CURRENT_TIMESTAMP)
+            (
+                %s,
+                1,
+                CURRENT_TIMESTAMP
+            )
 
         ON CONFLICT (ip)
+
         DO UPDATE SET
+
             attempts =
-                failed_attempts.attempts + 1,
+                failed_attempts.attempts
+                + 1,
+
             last_attempt =
                 CURRENT_TIMESTAMP
-    """, (ip,))
+    """, (
+        ip,
+    ))
+
 
     conn.commit()
+
 
     cur.close()
     conn.close()
@@ -435,12 +661,17 @@ def reset_attempts(ip):
     conn = get_db()
     cur = conn.cursor()
 
+
     cur.execute("""
         DELETE FROM failed_attempts
         WHERE ip = %s
-    """, (ip,))
+    """, (
+        ip,
+    ))
+
 
     conn.commit()
+
 
     cur.close()
     conn.close()
@@ -454,17 +685,27 @@ def reset_attempts(ip):
 def home():
 
     return jsonify({
+
         "success": True,
-        "message": "Спокойный ум API работает"
+
+        "message":
+            "Спокойный ум API работает"
+
     })
 
 
-@app.route("/api/health")
+@app.route(
+    "/api/health"
+)
 def health():
 
     return jsonify({
+
         "success": True,
-        "message": "Server is online"
+
+        "message":
+            "Server is online"
+
     })
 
 
@@ -472,74 +713,128 @@ def health():
 # REGISTER
 # =========================================================
 
-@app.route("/api/register", methods=["POST"])
+@app.route(
+    "/api/register",
+    methods=["POST"]
+)
 def register():
 
     try:
 
         data = get_json()
 
+
         username = normalize(
             data.get("username")
         )
+
 
         email = normalize(
             data.get("email")
         )
 
+
         password = str(
-            data.get("password") or ""
+            data.get("password")
+            or ""
         )
 
+
         display_name = str(
-            data.get("display_name")
-            or data.get("displayName")
+
+            data.get(
+                "display_name"
+            )
+
+            or data.get(
+                "displayName"
+            )
+
             or username
+
         ).strip()
 
-        if not username or not email or not password:
+
+        if (
+            not username
+            or not email
+            or not password
+        ):
 
             return jsonify({
+
                 "success": False,
-                "message": "Заполните все поля"
+
+                "message":
+                    "Заполните все поля"
+
             }), 400
+
 
         if len(username) < 3:
 
             return jsonify({
+
                 "success": False,
+
                 "message":
-                    "Логин должен содержать минимум 3 символа"
+                    "Логин должен содержать "
+                    "минимум 3 символа"
+
             }), 400
+
 
         if len(password) < 6:
 
             return jsonify({
+
                 "success": False,
+
                 "message":
-                    "Пароль должен содержать минимум 6 символов"
+                    "Пароль должен содержать "
+                    "минимум 6 символов"
+
             }), 400
 
-        if get_user_by_username(username):
+
+        if get_user_by_username(
+            username
+        ):
 
             return jsonify({
+
                 "success": False,
+
                 "message":
-                    "Такой логин уже существует"
+                    "Такой логин "
+                    "уже существует"
+
             }), 409
 
-        if get_user_by_email(email):
+
+        if get_user_by_email(
+            email
+        ):
 
             return jsonify({
+
                 "success": False,
+
                 "message":
-                    "Такая почта уже зарегистрирована"
+                    "Такая почта "
+                    "уже зарегистрирована"
+
             }), 409
 
-        password_hash = hash_password(password)
+
+        password_hash = hash_password(
+            password
+        )
+
 
         conn = get_db()
         cur = conn.cursor()
+
 
         cur.execute("""
             INSERT INTO users
@@ -549,8 +844,14 @@ def register():
                     display_name,
                     email
                 )
+
             VALUES
-                (%s, %s, %s, %s)
+                (
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
 
             RETURNING
                 id,
@@ -559,23 +860,35 @@ def register():
                 email,
                 role
         """, (
+
             username,
-            psycopg2.Binary(password_hash),
+
+            psycopg2.Binary(
+                password_hash
+            ),
+
             display_name,
+
             email
+
         ))
+
 
         user = cur.fetchone()
 
+
         conn.commit()
+
 
         cur.close()
         conn.close()
+
 
         token = create_token(
             user[0],
             user[1]
         )
+
 
         return jsonify({
 
@@ -584,25 +897,40 @@ def register():
             "token": token,
 
             "user": {
+
                 "id": user[0],
+
                 "username": user[1],
-                "display_name": user[2],
-                "email": user[3],
-                "role": user[4]
+
+                "display_name":
+                    user[2],
+
+                "email":
+                    user[3],
+
+                "role":
+                    user[4]
+
             }
 
         }), 201
 
+
     except Exception as e:
 
         print(
-            f"❌ REGISTER ERROR: "
+            f"REGISTER ERROR: "
             f"{type(e).__name__}: {e}"
         )
 
+
         return jsonify({
+
             "success": False,
-            "message": "Ошибка сервера"
+
+            "message":
+                "Ошибка сервера"
+
         }), 500
 
 
@@ -610,93 +938,150 @@ def register():
 # LOGIN
 # =========================================================
 
-@app.route("/api/login", methods=["POST"])
+@app.route(
+    "/api/login",
+    methods=["POST"]
+)
 def login():
 
     try:
 
-        ip = request.remote_addr or "unknown"
+        ip = (
+            request.remote_addr
+            or "unknown"
+        )
+
 
         data = get_json()
 
+
         login_value = normalize(
+
             data.get("login")
+
             or data.get("username")
+
             or data.get("email")
+
         )
+
 
         password = str(
-            data.get("password") or ""
+            data.get("password")
+            or ""
         )
 
-        if not login_value or not password:
+
+        if (
+            not login_value
+            or not password
+        ):
 
             return jsonify({
+
                 "success": False,
-                "message": "Заполните все поля"
+
+                "message":
+                    "Заполните все поля"
+
             }), 400
+
 
         if is_blocked(ip):
 
             return jsonify({
+
                 "success": False,
+
                 "message":
                     "Слишком много попыток. "
                     "Подождите 5 минут."
+
             }), 429
+
 
         user = get_user_by_login(
             login_value
         )
 
+
         if not user:
 
-            record_failed_attempt(ip)
+            record_failed_attempt(
+                ip
+            )
 
             return jsonify({
+
                 "success": False,
-                "message": "Пользователь не найден"
+
+                "message":
+                    "Пользователь не найден"
+
             }), 401
 
+
         try:
+
+            # =================================================
+            # ГЛАВНОЕ ИСПРАВЛЕНИЕ:
+            # PostgreSQL BYTEA -> memoryview.
+            # check_password превращает его в bytes.
+            # =================================================
 
             correct = check_password(
                 password,
                 user[2]
             )
 
+
         except Exception as e:
 
             print(
-                f"❌ BCRYPT ERROR: "
+                f"BCRYPT ERROR: "
                 f"{type(e).__name__}: {e}"
             )
 
+
             return jsonify({
+
                 "success": False,
+
                 "message":
                     "Ошибка проверки пароля"
+
             }), 500
+
 
         if not correct:
 
-            record_failed_attempt(ip)
+            record_failed_attempt(
+                ip
+            )
 
             return jsonify({
+
                 "success": False,
-                "message": "Неверный пароль"
+
+                "message":
+                    "Неверный пароль"
+
             }), 401
 
+
         reset_attempts(ip)
+
 
         token = create_token(
             user[0],
             user[1]
         )
 
+
         print(
-            f"✅ LOGIN: @{user[1]} вошёл"
+            f"LOGIN: @{user[1]} вошёл"
         )
+
 
         return jsonify({
 
@@ -705,24 +1090,39 @@ def login():
             "token": token,
 
             "user": {
-                "id": user[0],
-                "username": user[1],
-                "display_name": user[3],
-                "email": user[4]
+
+                "id":
+                    user[0],
+
+                "username":
+                    user[1],
+
+                "display_name":
+                    user[3],
+
+                "email":
+                    user[4]
+
             }
 
         })
 
+
     except Exception as e:
 
         print(
-            f"❌ LOGIN ERROR: "
+            f"LOGIN ERROR: "
             f"{type(e).__name__}: {e}"
         )
 
+
         return jsonify({
+
             "success": False,
-            "message": "Ошибка сервера"
+
+            "message":
+                "Ошибка сервера"
+
         }), 500
 
 
@@ -730,47 +1130,72 @@ def login():
 # ME
 # =========================================================
 
-@app.route("/api/me", methods=["GET"])
+@app.route(
+    "/api/me",
+    methods=["GET"]
+)
 def me():
 
     user = auth_user()
 
+
     if not user:
         return auth_error()
+
 
     return jsonify({
 
         "success": True,
 
         "user": {
-            "id": user[0],
-            "username": user[1],
-            "display_name": user[2],
-            "email": user[3],
-            "role": user[4]
+
+            "id":
+                user[0],
+
+            "username":
+                user[1],
+
+            "display_name":
+                user[2],
+
+            "email":
+                user[3],
+
+            "role":
+                user[4]
+
         }
 
     })
 
 
 # =========================================================
-# USERS / SEARCH
+# USERS
 # =========================================================
 
-@app.route("/api/users", methods=["GET"])
+@app.route(
+    "/api/users",
+    methods=["GET"]
+)
 def users():
 
     user = auth_user()
 
+
     if not user:
         return auth_error()
 
+
     search = normalize(
-        request.args.get("search")
+        request.args.get(
+            "search"
+        )
     )
+
 
     conn = get_db()
     cur = conn.cursor()
+
 
     if search:
 
@@ -788,9 +1213,13 @@ def users():
             ORDER BY username
             LIMIT 50
         """, (
+
             f"%{search}%",
+
             f"%{search}%"
+
         ))
+
 
     else:
 
@@ -806,10 +1235,13 @@ def users():
             LIMIT 50
         """)
 
+
     rows = cur.fetchall()
+
 
     cur.close()
     conn.close()
+
 
     return jsonify({
 
@@ -818,33 +1250,52 @@ def users():
         "users": [
 
             {
-                "id": row[0],
-                "username": row[1],
-                "display_name": row[2],
-                "email": row[3],
-                "role": row[4]
+
+                "id":
+                    row[0],
+
+                "username":
+                    row[1],
+
+                "display_name":
+                    row[2],
+
+                "email":
+                    row[3],
+
+                "role":
+                    row[4]
+
             }
 
             for row in rows
+
         ]
 
     })
 
 
-@app.route("/api/search", methods=["GET"])
+@app.route(
+    "/api/search",
+    methods=["GET"]
+)
 def search():
 
     user = auth_user()
 
+
     if not user:
         return auth_error()
+
 
     query = normalize(
         request.args.get("q")
     )
 
+
     conn = get_db()
     cur = conn.cursor()
+
 
     cur.execute("""
         SELECT
@@ -861,15 +1312,22 @@ def search():
         ORDER BY username
         LIMIT 50
     """, (
+
         f"%{query}%",
+
         f"%{query}%",
+
         f"%{query}%"
+
     ))
+
 
     rows = cur.fetchall()
 
+
     cur.close()
     conn.close()
+
 
     return jsonify({
 
@@ -878,14 +1336,26 @@ def search():
         "users": [
 
             {
-                "id": row[0],
-                "username": row[1],
-                "display_name": row[2],
-                "email": row[3],
-                "role": row[4]
+
+                "id":
+                    row[0],
+
+                "username":
+                    row[1],
+
+                "display_name":
+                    row[2],
+
+                "email":
+                    row[3],
+
+                "role":
+                    row[4]
+
             }
 
             for row in rows
+
         ]
 
     })
@@ -895,16 +1365,22 @@ def search():
 # POSTS
 # =========================================================
 
-@app.route("/api/posts", methods=["GET"])
+@app.route(
+    "/api/posts",
+    methods=["GET"]
+)
 def get_posts():
 
     user = auth_user()
 
+
     if not user:
         return auth_error()
 
+
     conn = get_db()
     cur = conn.cursor()
+
 
     cur.execute("""
         SELECT
@@ -915,6 +1391,7 @@ def get_posts():
             p.content,
             p.created_at,
             COUNT(l.id)
+
         FROM posts p
 
         JOIN users u
@@ -931,15 +1408,19 @@ def get_posts():
             p.content,
             p.created_at
 
-        ORDER BY p.created_at DESC
+        ORDER BY
+            p.created_at DESC
 
         LIMIT 100
     """)
 
+
     rows = cur.fetchall()
+
 
     cur.close()
     conn.close()
+
 
     return jsonify({
 
@@ -948,84 +1429,150 @@ def get_posts():
         "posts": [
 
             {
-                "id": row[0],
-                "user_id": row[1],
-                "username": row[2],
-                "display_name": row[3],
-                "content": row[4],
+
+                "id":
+                    row[0],
+
+                "user_id":
+                    row[1],
+
+                "username":
+                    row[2],
+
+                "display_name":
+                    row[3],
+
+                "content":
+                    row[4],
+
                 "created_at":
                     row[5].isoformat()
-                    if row[5] else None,
-                "likes": row[6]
+                    if row[5]
+                    else None,
+
+                "likes":
+                    row[6]
+
             }
 
             for row in rows
+
         ]
 
     })
 
 
-@app.route("/api/posts", methods=["POST"])
+@app.route(
+    "/api/posts",
+    methods=["POST"]
+)
 def create_post():
 
     user = auth_user()
 
+
     if not user:
         return auth_error()
 
+
     data = get_json()
 
+
     content = str(
-        data.get("content") or ""
+        data.get("content")
+        or ""
     ).strip()
+
 
     if not content:
 
         return jsonify({
+
             "success": False,
-            "message": "Введите текст"
+
+            "message":
+                "Введите текст"
+
         }), 400
+
 
     if len(content) > 5000:
 
         return jsonify({
+
             "success": False,
-            "message": "Пост слишком длинный"
+
+            "message":
+                "Пост слишком длинный"
+
         }), 400
+
 
     conn = get_db()
     cur = conn.cursor()
 
+
     cur.execute("""
         INSERT INTO posts
-            (user_id, content)
+            (
+                user_id,
+                content
+            )
+
         VALUES
-            (%s, %s)
-        RETURNING id, created_at
+            (
+                %s,
+                %s
+            )
+
+        RETURNING
+            id,
+            created_at
     """, (
+
         user[0],
+
         content
+
     ))
 
-    post_id, created_at = cur.fetchone()
+
+    post_id, created_at = (
+        cur.fetchone()
+    )
+
 
     conn.commit()
 
+
     cur.close()
     conn.close()
+
 
     return jsonify({
 
         "success": True,
 
         "post": {
-            "id": post_id,
-            "user_id": user[0],
-            "username": user[1],
-            "display_name": user[2],
-            "content": content,
+
+            "id":
+                post_id,
+
+            "user_id":
+                user[0],
+
+            "username":
+                user[1],
+
+            "display_name":
+                user[2],
+
+            "content":
+                content,
+
             "created_at":
                 created_at.isoformat()
+
         }
 
     }), 201
@@ -1039,11 +1586,14 @@ def like_post(post_id):
 
     user = auth_user()
 
+
     if not user:
         return auth_error()
 
+
     conn = get_db()
     cur = conn.cursor()
+
 
     cur.execute("""
         SELECT id
@@ -1052,54 +1602,85 @@ def like_post(post_id):
             post_id = %s
             AND user_id = %s
     """, (
+
         post_id,
+
         user[0]
+
     ))
 
+
     existing = cur.fetchone()
+
 
     if existing:
 
         cur.execute("""
             DELETE FROM likes
             WHERE id = %s
-        """, (existing[0],))
+        """, (
+            existing[0],
+        ))
 
         liked = False
+
 
     else:
 
         cur.execute("""
             INSERT INTO likes
-                (post_id, user_id)
+                (
+                    post_id,
+                    user_id
+                )
+
             VALUES
-                (%s, %s)
+                (
+                    %s,
+                    %s
+                )
+
             ON CONFLICT DO NOTHING
         """, (
+
             post_id,
+
             user[0]
+
         ))
 
         liked = True
+
 
     cur.execute("""
         SELECT COUNT(*)
         FROM likes
         WHERE post_id = %s
-    """, (post_id,))
+    """, (
+        post_id,
+    ))
+
 
     count = cur.fetchone()[0]
 
+
     conn.commit()
+
 
     cur.close()
     conn.close()
 
+
     return jsonify({
 
-        "success": True,
-        "liked": liked,
-        "likes": count
+        "success":
+            True,
+
+        "liked":
+            liked,
+
+        "likes":
+            count
 
     })
 
@@ -1108,16 +1689,22 @@ def like_post(post_id):
 # CHATS
 # =========================================================
 
-@app.route("/api/chats", methods=["GET"])
+@app.route(
+    "/api/chats",
+    methods=["GET"]
+)
 def get_chats():
 
     user = auth_user()
 
+
     if not user:
         return auth_error()
 
+
     conn = get_db()
     cur = conn.cursor()
+
 
     cur.execute("""
         SELECT
@@ -1146,18 +1733,24 @@ def get_chats():
             c.user1_id = %s
             OR c.user2_id = %s
 
-        ORDER BY c.created_at DESC
+        ORDER BY
+            c.created_at DESC
     """, (
+
         user[0],
         user[0],
         user[0],
         user[0]
+
     ))
+
 
     rows = cur.fetchall()
 
+
     cur.close()
     conn.close()
+
 
     return jsonify({
 
@@ -1166,48 +1759,81 @@ def get_chats():
         "chats": [
 
             {
-                "id": row[0],
-                "user_id": row[1],
-                "username": row[2],
-                "display_name": row[3]
+
+                "id":
+                    row[0],
+
+                "user_id":
+                    row[1],
+
+                "username":
+                    row[2],
+
+                "display_name":
+                    row[3]
+
             }
 
             for row in rows
+
         ]
 
     })
 
 
-@app.route("/api/chats", methods=["POST"])
+@app.route(
+    "/api/chats",
+    methods=["POST"]
+)
 def create_chat():
 
     user = auth_user()
 
+
     if not user:
         return auth_error()
 
+
     data = get_json()
 
+
     try:
+
         other_user_id = int(
             data.get("user_id")
         )
-    except:
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
         return jsonify({
+
             "success": False,
-            "message": "Неверный user_id"
+
+            "message":
+                "Неверный user_id"
+
         }), 400
+
 
     if other_user_id == user[0]:
 
         return jsonify({
+
             "success": False,
+
             "message":
-                "Нельзя создать чат с самим собой"
+                "Нельзя создать "
+                "чат с самим собой"
+
         }), 400
+
 
     conn = get_db()
     cur = conn.cursor()
+
 
     cur.execute("""
         SELECT
@@ -1216,19 +1842,30 @@ def create_chat():
             display_name
         FROM users
         WHERE id = %s
-    """, (other_user_id,))
+    """, (
+        other_user_id,
+    ))
+
 
     other = cur.fetchone()
+
 
     if not other:
 
         cur.close()
         conn.close()
 
+
         return jsonify({
+
             "success": False,
-            "message": "Пользователь не найден"
+
+            "message":
+                "Пользователь "
+                "не найден"
+
         }), 404
+
 
     cur.execute("""
         SELECT id
@@ -1238,54 +1875,91 @@ def create_chat():
                 user1_id = %s
                 AND user2_id = %s
             )
+
             OR
+
             (
                 user1_id = %s
                 AND user2_id = %s
             )
+
         LIMIT 1
     """, (
+
         user[0],
+
         other_user_id,
+
         other_user_id,
+
         user[0]
+
     ))
 
+
     chat = cur.fetchone()
+
 
     if chat:
 
         chat_id = chat[0]
 
+
     else:
 
         cur.execute("""
             INSERT INTO chats
-                (user1_id, user2_id)
+                (
+                    user1_id,
+                    user2_id
+                )
+
             VALUES
-                (%s, %s)
+                (
+                    %s,
+                    %s
+                )
+
             RETURNING id
         """, (
+
             user[0],
+
             other_user_id
+
         ))
 
-        chat_id = cur.fetchone()[0]
+
+        chat_id = (
+            cur.fetchone()[0]
+        )
+
 
     conn.commit()
 
+
     cur.close()
     conn.close()
+
 
     return jsonify({
 
         "success": True,
 
         "chat": {
-            "id": chat_id,
-            "user_id": other[0],
-            "username": other[1],
-            "display_name": other[2]
+
+            "id":
+                chat_id,
+
+            "user_id":
+                other[0],
+
+            "username":
+                other[1],
+
+            "display_name":
+                other[2]
+
         }
 
     })
@@ -1295,38 +1969,65 @@ def create_chat():
 # MESSAGES
 # =========================================================
 
-@app.route("/api/messages", methods=["GET"])
+@app.route(
+    "/api/messages",
+    methods=["GET"]
+)
 def get_messages():
 
     user = auth_user()
 
+
     if not user:
         return auth_error()
 
+
     try:
+
         other_user_id = int(
-            request.args.get("user_id")
+            request.args.get(
+                "user_id"
+            )
         )
-    except:
+
+    except (
+        TypeError,
+        ValueError
+    ):
 
         return jsonify({
+
             "success": False,
-            "message": "Неверный user_id"
+
+            "message":
+                "Неверный user_id"
+
         }), 400
+
 
     conn = get_db()
     cur = conn.cursor()
 
+
     cur.execute("""
         SELECT
+
             m.id,
+
             m.sender_id,
+
             su.username,
+
             su.display_name,
+
             m.receiver_id,
+
             ru.username,
+
             ru.display_name,
+
             m.content,
+
             m.created_at
 
         FROM messages m
@@ -1338,30 +2039,42 @@ def get_messages():
             ON ru.id = m.receiver_id
 
         WHERE
-            (
-                m.sender_id = %s
-                AND m.receiver_id = %s
-            )
-            OR
+
             (
                 m.sender_id = %s
                 AND m.receiver_id = %s
             )
 
-        ORDER BY m.created_at ASC
+            OR
+
+            (
+                m.sender_id = %s
+                AND m.receiver_id = %s
+            )
+
+        ORDER BY
+            m.created_at ASC
 
         LIMIT 500
     """, (
+
         user[0],
+
         other_user_id,
+
         other_user_id,
+
         user[0]
+
     ))
+
 
     rows = cur.fetchall()
 
+
     cur.close()
     conn.close()
+
 
     return jsonify({
 
@@ -1370,75 +2083,128 @@ def get_messages():
         "messages": [
 
             {
-                "id": row[0],
-                "sender_id": row[1],
-                "sender_username": row[2],
-                "sender_display_name": row[3],
-                "receiver_id": row[4],
-                "receiver_username": row[5],
-                "receiver_display_name": row[6],
-                "content": row[7],
+
+                "id":
+                    row[0],
+
+                "sender_id":
+                    row[1],
+
+                "sender_username":
+                    row[2],
+
+                "sender_display_name":
+                    row[3],
+
+                "receiver_id":
+                    row[4],
+
+                "receiver_username":
+                    row[5],
+
+                "receiver_display_name":
+                    row[6],
+
+                "content":
+                    row[7],
+
                 "created_at":
                     row[8].isoformat()
-                    if row[8] else None
+                    if row[8]
+                    else None
+
             }
 
             for row in rows
+
         ]
 
     })
 
 
-@app.route("/api/messages", methods=["POST"])
+@app.route(
+    "/api/messages",
+    methods=["POST"]
+)
 def send_message():
 
     user = auth_user()
 
+
     if not user:
         return auth_error()
 
+
     data = get_json()
 
+
     try:
+
         receiver_id = int(
             data.get("receiver_id")
         )
-    except:
+
+    except (
+        TypeError,
+        ValueError
+    ):
 
         return jsonify({
+
             "success": False,
-            "message": "Неверный receiver_id"
+
+            "message":
+                "Неверный receiver_id"
+
         }), 400
 
+
     content = str(
-        data.get("content") or ""
+        data.get("content")
+        or ""
     ).strip()
+
 
     if not content:
 
         return jsonify({
+
             "success": False,
-            "message": "Сообщение пустое"
+
+            "message":
+                "Сообщение пустое"
+
         }), 400
+
 
     if len(content) > 5000:
 
         return jsonify({
+
             "success": False,
+
             "message":
                 "Сообщение слишком длинное"
+
         }), 400
+
 
     if receiver_id == user[0]:
 
         return jsonify({
+
             "success": False,
+
             "message":
-                "Нельзя написать самому себе"
+                "Нельзя написать "
+                "самому себе"
+
         }), 400
+
 
     conn = get_db()
     cur = conn.cursor()
+
 
     cur.execute("""
         SELECT
@@ -1447,62 +2213,107 @@ def send_message():
             display_name
         FROM users
         WHERE id = %s
-    """, (receiver_id,))
+    """, (
+        receiver_id,
+    ))
+
 
     receiver = cur.fetchone()
+
 
     if not receiver:
 
         cur.close()
         conn.close()
 
+
         return jsonify({
+
             "success": False,
-            "message": "Получатель не найден"
+
+            "message":
+                "Получатель "
+                "не найден"
+
         }), 404
 
-    # Создаём чат, если его ещё нет
+
+    # -----------------------------------------------------
+    # Находим или создаём чат
+    # -----------------------------------------------------
+
     cur.execute("""
         SELECT id
         FROM chats
         WHERE
+
             (
                 user1_id = %s
                 AND user2_id = %s
             )
+
             OR
+
             (
                 user1_id = %s
                 AND user2_id = %s
             )
+
         LIMIT 1
     """, (
+
         user[0],
+
         receiver_id,
+
         receiver_id,
+
         user[0]
+
     ))
 
+
     chat = cur.fetchone()
+
 
     if chat:
 
         chat_id = chat[0]
 
+
     else:
 
         cur.execute("""
             INSERT INTO chats
-                (user1_id, user2_id)
+                (
+                    user1_id,
+                    user2_id
+                )
+
             VALUES
-                (%s, %s)
+                (
+                    %s,
+                    %s
+                )
+
             RETURNING id
         """, (
+
             user[0],
+
             receiver_id
+
         ))
 
-        chat_id = cur.fetchone()[0]
+
+        chat_id = (
+            cur.fetchone()[0]
+        )
+
+
+    # -----------------------------------------------------
+    # Сохраняем сообщение
+    # -----------------------------------------------------
 
     cur.execute("""
         INSERT INTO messages
@@ -1511,61 +2322,97 @@ def send_message():
                 receiver_id,
                 content
             )
-        VALUES
-            (%s, %s, %s)
 
-        RETURNING id, created_at
+        VALUES
+            (
+                %s,
+                %s,
+                %s
+            )
+
+        RETURNING
+            id,
+            created_at
     """, (
+
         user[0],
+
         receiver_id,
+
         content
+
     ))
 
-    message_id, created_at = cur.fetchone()
+
+    message_id, created_at = (
+        cur.fetchone()
+    )
+
 
     conn.commit()
+
 
     cur.close()
     conn.close()
 
+
     message = {
 
-        "id": message_id,
+        "id":
+            message_id,
 
-        "chat_id": chat_id,
+        "chat_id":
+            chat_id,
 
-        "sender_id": user[0],
-        "sender_username": user[1],
-        "sender_display_name": user[2],
+        "sender_id":
+            user[0],
 
-        "receiver_id": receiver_id,
-        "receiver_username": receiver[1],
-        "receiver_display_name": receiver[2],
+        "sender_username":
+            user[1],
 
-        "content": content,
+        "sender_display_name":
+            user[2],
+
+        "receiver_id":
+            receiver_id,
+
+        "receiver_username":
+            receiver[1],
+
+        "receiver_display_name":
+            receiver[2],
+
+        "content":
+            content,
 
         "created_at":
             created_at.isoformat()
+
     }
 
-    # Отправляем сообщение через Socket.IO
+
+    # Отправляем получателю
     socketio.emit(
         "new_message",
         message,
         room=receiver[1]
     )
 
+
+    # Подтверждение отправителю
     socketio.emit(
         "message_sent",
         message,
         room=user[1]
     )
 
+
     return jsonify({
 
         "success": True,
 
-        "message": message
+        "message":
+            message
 
     }), 201
 
@@ -1574,60 +2421,179 @@ def send_message():
 # MOOD
 # =========================================================
 
-@app.route("/api/mood", methods=["POST"])
+@app.route(
+    "/api/mood",
+    methods=["POST"]
+)
 def save_mood():
 
     user = auth_user()
 
+
     if not user:
         return auth_error()
 
+
     data = get_json()
 
+
     mood = str(
-        data.get("mood") or ""
+        data.get("mood")
+        or ""
     ).strip()
+
 
     if not mood:
 
         return jsonify({
+
             "success": False,
+
             "message":
                 "Укажите настроение"
+
         }), 400
+
 
     conn = get_db()
     cur = conn.cursor()
 
+
     cur.execute("""
         INSERT INTO moods
-            (user_id, mood)
-        VALUES
-            (%s, %s)
+            (
+                user_id,
+                mood
+            )
 
-        RETURNING id, created_at
+        VALUES
+            (
+                %s,
+                %s
+            )
+
+        RETURNING
+            id,
+            created_at
     """, (
+
         user[0],
+
         mood
+
     ))
+
 
     row = cur.fetchone()
 
+
     conn.commit()
+
 
     cur.close()
     conn.close()
+
 
     return jsonify({
 
         "success": True,
 
         "mood": {
-            "id": row[0],
-            "mood": mood,
+
+            "id":
+                row[0],
+
+            "mood":
+                mood,
+
             "created_at":
                 row[1].isoformat()
+
         }
+
+    })
+
+
+# =========================================================
+# GET MOOD
+# =========================================================
+
+@app.route(
+    "/api/mood/<username>",
+    methods=["GET"]
+)
+def get_mood(username):
+
+    user = auth_user()
+
+
+    if not user:
+        return auth_error()
+
+
+    username = normalize(
+        username
+    )
+
+
+    conn = get_db()
+    cur = conn.cursor()
+
+
+    cur.execute("""
+        SELECT
+            m.id,
+            m.mood,
+            m.created_at
+
+        FROM moods m
+
+        JOIN users u
+            ON u.id = m.user_id
+
+        WHERE
+            u.username = %s
+
+        ORDER BY
+            m.created_at DESC
+
+        LIMIT 100
+    """, (
+        username,
+    ))
+
+
+    rows = cur.fetchall()
+
+
+    cur.close()
+    conn.close()
+
+
+    return jsonify({
+
+        "success": True,
+
+        "moods": [
+
+            {
+
+                "id":
+                    row[0],
+
+                "mood":
+                    row[1],
+
+                "created_at":
+                    row[2].isoformat()
+                    if row[2]
+                    else None
+
+            }
+
+            for row in rows
+
+        ]
 
     })
 
@@ -1636,59 +2602,179 @@ def save_mood():
 # GRATITUDE
 # =========================================================
 
-@app.route("/api/gratitude", methods=["POST"])
+@app.route(
+    "/api/gratitude",
+    methods=["POST"]
+)
 def save_gratitude():
 
     user = auth_user()
 
+
     if not user:
         return auth_error()
 
+
     data = get_json()
 
+
     content = str(
-        data.get("content") or ""
+        data.get("content")
+        or ""
     ).strip()
+
 
     if not content:
 
         return jsonify({
+
             "success": False,
-            "message": "Введите текст"
+
+            "message":
+                "Введите текст"
+
         }), 400
+
 
     conn = get_db()
     cur = conn.cursor()
 
+
     cur.execute("""
         INSERT INTO gratitude
-            (user_id, content)
-        VALUES
-            (%s, %s)
+            (
+                user_id,
+                content
+            )
 
-        RETURNING id, created_at
+        VALUES
+            (
+                %s,
+                %s
+            )
+
+        RETURNING
+            id,
+            created_at
     """, (
+
         user[0],
+
         content
+
     ))
+
 
     row = cur.fetchone()
 
+
     conn.commit()
+
 
     cur.close()
     conn.close()
+
 
     return jsonify({
 
         "success": True,
 
         "gratitude": {
-            "id": row[0],
-            "content": content,
+
+            "id":
+                row[0],
+
+            "content":
+                content,
+
             "created_at":
                 row[1].isoformat()
+
         }
+
+    })
+
+
+# =========================================================
+# GET GRATITUDE
+# =========================================================
+
+@app.route(
+    "/api/gratitude/<username>",
+    methods=["GET"]
+)
+def get_gratitude(username):
+
+    user = auth_user()
+
+
+    if not user:
+        return auth_error()
+
+
+    username = normalize(
+        username
+    )
+
+
+    conn = get_db()
+    cur = conn.cursor()
+
+
+    cur.execute("""
+        SELECT
+            g.id,
+            g.content,
+            g.created_at
+
+        FROM gratitude g
+
+        JOIN users u
+            ON u.id = g.user_id
+
+        WHERE
+            u.username = %s
+
+        ORDER BY
+            g.created_at DESC
+
+        LIMIT 100
+    """, (
+        username,
+    ))
+
+
+    rows = cur.fetchall()
+
+
+    cur.close()
+    conn.close()
+
+
+    return jsonify({
+
+        "success": True,
+
+        "gratitude": [
+
+            {
+
+                "id":
+                    row[0],
+
+                "content":
+                    row[1],
+
+                "created_at":
+                    row[2].isoformat()
+                    if row[2]
+                    else None
+
+            }
+
+            for row in rows
+
+        ]
 
     })
 
@@ -1705,32 +2791,50 @@ def make_moderator():
 
     user = auth_user()
 
+
     if not user:
         return auth_error()
+
 
     if user[4] != "admin":
 
         return jsonify({
+
             "success": False,
+
             "message":
                 "Недостаточно прав"
+
         }), 403
+
 
     data = get_json()
 
+
     try:
+
         target_id = int(
             data.get("user_id")
         )
-    except:
+
+    except (
+        TypeError,
+        ValueError
+    ):
 
         return jsonify({
+
             "success": False,
-            "message": "Неверный user_id"
+
+            "message":
+                "Неверный user_id"
+
         }), 400
+
 
     conn = get_db()
     cur = conn.cursor()
+
 
     cur.execute("""
         UPDATE users
@@ -1743,31 +2847,49 @@ def make_moderator():
             id,
             username,
             role
-    """, (target_id,))
+    """, (
+        target_id,
+    ))
+
 
     result = cur.fetchone()
 
+
     conn.commit()
+
 
     cur.close()
     conn.close()
 
+
     if not result:
 
         return jsonify({
+
             "success": False,
+
             "message":
-                "Пользователь не найден"
+                "Пользователь "
+                "не найден"
+
         }), 404
+
 
     return jsonify({
 
         "success": True,
 
         "user": {
-            "id": result[0],
-            "username": result[1],
-            "role": result[2]
+
+            "id":
+                result[0],
+
+            "username":
+                result[1],
+
+            "role":
+                result[2]
+
         }
 
     })
@@ -1787,43 +2909,70 @@ def socket_connect(auth):
 
         token = None
 
-        if isinstance(auth, dict):
-            token = auth.get("token")
 
-        user = get_user_by_token(token)
+        if isinstance(
+            auth,
+            dict
+        ):
+
+            token = auth.get(
+                "token"
+            )
+
+
+        user = get_user_by_token(
+            token
+        )
+
 
         if not user:
 
             print(
-                "❌ SOCKET: неверный токен"
+                "SOCKET: "
+                "неверный токен"
             )
 
             return False
 
+
         username = user[1]
 
-        join_room(username)
 
-        connected_users[username] = request.sid
+        join_room(
+            username
+        )
+
+
+        connected_users[
+            username
+        ] = request.sid
+
 
         print(
-            f"🟢 SOCKET: @{username} подключился"
+            f"SOCKET: "
+            f"@{username} подключился"
         )
+
 
         emit(
             "connected",
             {
-                "success": True,
-                "username": username
+                "success":
+                    True,
+
+                "username":
+                    username
             }
         )
 
+
         return True
+
 
     except Exception as e:
 
         print(
-            f"❌ SOCKET ERROR: "
+            f"SOCKET ERROR: "
             f"{type(e).__name__}: {e}"
         )
 
@@ -1835,19 +2984,29 @@ def socket_disconnect():
 
     try:
 
-        for username, sid in list(
+        for (
+            username,
+            sid
+        ) in list(
             connected_users.items()
         ):
 
             if sid == request.sid:
 
-                del connected_users[username]
+                del connected_users[
+                    username
+                ]
+
 
                 print(
-                    f"🔴 SOCKET: @{username} отключился"
+                    f"SOCKET: "
+                    f"@{username} "
+                    f"отключился"
                 )
 
+
                 break
+
 
     except Exception as e:
 
@@ -1868,7 +3027,7 @@ try:
 except Exception as e:
 
     print(
-        f"❌ DATABASE ERROR: "
+        f"DATABASE ERROR: "
         f"{type(e).__name__}: {e}"
     )
 
@@ -1882,8 +3041,13 @@ if __name__ == "__main__":
         )
     )
 
+
     socketio.run(
+
         app,
+
         host="0.0.0.0",
+
         port=port
+
     )
