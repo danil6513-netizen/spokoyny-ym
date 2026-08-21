@@ -123,10 +123,6 @@ def init_db():
             )
         """)
 
-        # INDEXES
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_at DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender_receiver ON messages(sender_id, receiver_id)")
-
         conn.commit()
         print("✅ DATABASE INITIALIZED SUCCESSFULLY")
 
@@ -687,7 +683,7 @@ def create_chat():
 
 
 # =========================================================
-# MESSAGES (ИСПРАВЛЕНО: ПОДДЕРЖИВАЕТ ОБА ФОРМАТА)
+# MESSAGES — ИСПРАВЛЕНО! (ПОДДЕРЖИВАЕТ ОБА ФОРМАТА)
 # =========================================================
 
 @app.route("/api/messages", methods=["GET"])
@@ -751,10 +747,9 @@ def send_message():
     data = request.get_json(silent=True) or {}
 
     # =========================================================
-    # ПОДДЕРЖКА ОБОИХ ФОРМАТОВ (sender_id/receiver_id И from_user/to_user)
+    # ПОДДЕРЖКА ОБОИХ ФОРМАТОВ
     # =========================================================
 
-    # Получаем receiver_id или to_user
     receiver_id = data.get("receiver_id")
     to_user = data.get("to_user")
 
@@ -769,7 +764,6 @@ def send_message():
     if not receiver_id:
         return jsonify({"success": False, "message": "Не указан получатель"}), 400
 
-    # content или text
     content = data.get("content") or data.get("text") or ""
     if not content:
         return jsonify({"success": False, "message": "Введите сообщение"}), 400
