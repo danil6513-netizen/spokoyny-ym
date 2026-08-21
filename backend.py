@@ -1,26 +1,18 @@
+import os
+import datetime
+import bcrypt
+import jwt
+import psycopg2
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit, join_room
-from functools import wraps
-import psycopg2
-import psycopg2.extras
-import bcrypt
-import jwt
-import datetime
-import json
-import re
-import time
-import os
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 app = Flask(__name__)
-
-CORS(app)
-
-socketio = SocketIO(
-    app,
-    cors_allowed_origins="*",
-    async_mode="eventlet"
-)
 
 SECRET_KEY = os.environ.get(
     "SECRET_KEY",
@@ -29,77 +21,35 @@ SECRET_KEY = os.environ.get(
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL не задан в Environment Render")
+CORS(
+    app,
+    resources={r"/api/*": {"origins": "*"}},
+    supports_credentials=True
+)
+
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="eventlet"
+)
 
 
-# ============================================================
+# =========================================================
 # DATABASE
-# ============================================================
-
-class ReturningCursor(psycopg2.extensions.cursor):
-    def execute(self, query, vars=None):
-        super().execute(query, vars)
-        return self
-
+# =========================================================
 
 def get_db():
-    return psycopg2.connect(
-        DATABASE_URL,
-        cursor_factory=ReturningCursor
-    )
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL не задан")
 
+    return psycopg2.connect(DATABASE_URL)
 
-# ============================================================
-# LOGIN RATE LIMIT
-# ============================================================
-
-login_attempts = {}
-
-
-def is_blocked(ip):
-    if ip in login_attempts:
-        data = login_attempts[ip]
-
-        if (
-            data['blocked_until']
-            and data['blocked_until'] > time.time()
-        ):
-            return True
-
-    return False
-
-
-def record_failed_attempt(ip):
-    if ip not in login_attempts:
-        login_attempts[ip] = {
-            'attempts': 0,
-            'blocked_until': None
-        }
-
-    login_attempts[ip]['attempts'] += 1
-
-    if login_attempts[ip]['attempts'] >= 5:
-        login_attempts[ip]['blocked_until'] = time.time() + 300
-
-
-def reset_attempts(ip):
-    if ip in login_attempts:
-        login_attempts[ip] = {
-            'attempts': 0,
-            'blocked_until': None
-        }
-
-
-# ============================================================
-# DATABASE INIT
-# ============================================================
 
 def init_db():
     conn = get_db()
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
-    cursor.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
@@ -111,172 +61,159 @@ def init_db():
         )
     """)
 
-    cursor.execute("""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS failed_attempts (
+            ip TEXT PRIMARY KEY,
+            attempts INTEGER DEFAULT 0,
+            last_attempt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS posts (
             id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            text TEXT,
-            mood TEXT DEFAULT '·',
-            media TEXT,
-            time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    cursor.execute("""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS likes (
+            id SERIAL PRIMARY KEY,
+            post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE(post_id, user_id)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS chats (
+            id SERIAL PRIMARY KEY,
+            user1_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            user2_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id SERIAL PRIMARY KEY,
-            from_user TEXT NOT NULL,
-            to_user TEXT NOT NULL,
-            text TEXT NOT NULL,
-            time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            read BOOLEAN DEFAULT FALSE
+            sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            receiver_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    cursor.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS moods (
             id SERIAL PRIMARY KEY,
-            username TEXT NOT NULL,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
             mood TEXT NOT NULL,
-            date DATE DEFAULT CURRENT_DATE,
-            UNIQUE(username, date)
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    cursor.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS gratitude (
             id SERIAL PRIMARY KEY,
-            username TEXT NOT NULL,
-            text TEXT NOT NULL,
-            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS likes (
-            post_id INTEGER NOT NULL
-                REFERENCES posts(id)
-                ON DELETE CASCADE,
-
-            user_id INTEGER NOT NULL
-                REFERENCES users(id)
-                ON DELETE CASCADE,
-
-            PRIMARY KEY (post_id, user_id)
-        )
-    """)
-
-    # --------------------------------------------------------
-    # DEMO USERS
-    # --------------------------------------------------------
-
-    cursor.execute("SELECT COUNT(*) FROM users")
-
-    if cursor.fetchone()[0] == 0:
-
-        alex_hash = bcrypt.hashpw(
-            "alex123".encode("utf-8"),
-            bcrypt.gensalt()
-        )
-
-        marina_hash = bcrypt.hashpw(
-            "marina123".encode("utf-8"),
-            bcrypt.gensalt()
-        )
-
-        cursor.execute(
-            """
-            INSERT INTO users
-            (
-                username,
-                password_hash,
-                display_name,
-                email
-            )
-            VALUES (%s, %s, %s, %s)
-            RETURNING id
-            """,
-            (
-                "alex",
-                alex_hash,
-                "Алекс",
-                "alex@example.com"
-            )
-        )
-
-        alex_id = cursor.fetchone()[0]
-
-        cursor.execute(
-            """
-            INSERT INTO users
-            (
-                username,
-                password_hash,
-                display_name,
-                email
-            )
-            VALUES (%s, %s, %s, %s)
-            RETURNING id
-            """,
-            (
-                "marina",
-                marina_hash,
-                "Марина",
-                "marina@example.com"
-            )
-        )
-
-        marina_id = cursor.fetchone()[0]
-
-        cursor.execute(
-            """
-            INSERT INTO posts
-            (
-                user_id,
-                text,
-                mood
-            )
-            VALUES (%s, %s, %s)
-            """,
-            (
-                alex_id,
-                "тишина — это тоже голос",
-                "·"
-            )
-        )
-
-        cursor.execute(
-            """
-            INSERT INTO posts
-            (
-                user_id,
-                text,
-                mood
-            )
-            VALUES (%s, %s, %s)
-            """,
-            (
-                marina_id,
-                "заметил, как дышит ветер",
-                "◌"
-            )
-        )
 
     conn.commit()
 
-    cursor.close()
+    cur.close()
     conn.close()
 
-    print("✅ PostgreSQL база данных готова!")
+    print("✅ DATABASE INITIALIZED")
 
 
-# ============================================================
-# USER HELPERS
-# ============================================================
+# =========================================================
+# HELPERS
+# =========================================================
+
+def get_json():
+    return request.get_json(silent=True) or {}
+
+
+def normalize(value):
+    return str(value or "").strip().lower()
+
+
+# =========================================================
+# PASSWORD
+# =========================================================
+
+def hash_password(password):
+    return bcrypt.hashpw(
+        password.encode("utf-8"),
+        bcrypt.gensalt()
+    )
+
+
+def check_password(password, stored_hash):
+
+    # PostgreSQL BYTEA иногда возвращает memoryview.
+    # bcrypt требует bytes.
+    if isinstance(stored_hash, memoryview):
+        stored_hash = stored_hash.tobytes()
+
+    elif isinstance(stored_hash, bytearray):
+        stored_hash = bytes(stored_hash)
+
+    elif isinstance(stored_hash, str):
+        stored_hash = stored_hash.encode("utf-8")
+
+    return bcrypt.checkpw(
+        password.encode("utf-8"),
+        stored_hash
+    )
+
+
+# =========================================================
+# JWT
+# =========================================================
+
+def create_token(user_id, username):
+
+    return jwt.encode(
+        {
+            "user_id": user_id,
+            "username": username,
+            "exp": datetime.datetime.utcnow()
+                  + datetime.timedelta(days=7)
+        },
+        SECRET_KEY,
+        algorithm="HS256"
+    )
+
+
+def get_token_from_request():
+
+    auth = request.headers.get("Authorization", "")
+
+    if not auth:
+        return None
+
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+
+    return auth.strip()
+
 
 def get_user_by_token(token):
 
     try:
+
+        if not token:
+            print("❌ JWT: токен пустой")
+            return None
+
+        token = token.replace("Bearer ", "").strip()
 
         data = jwt.decode(
             token,
@@ -284,11 +221,18 @@ def get_user_by_token(token):
             algorithms=["HS256"]
         )
 
-        conn = get_db()
-        cursor = conn.cursor()
+        print("✅ JWT расшифрован")
 
-        user = cursor.execute(
-            """
+        user_id = data.get("user_id")
+
+        if not user_id:
+            print("❌ JWT: нет user_id")
+            return None
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        cur.execute("""
             SELECT
                 id,
                 username,
@@ -297,50 +241,76 @@ def get_user_by_token(token):
                 role
             FROM users
             WHERE id = %s
-            """,
-            [data['user_id']]
-        ).fetchone()
+        """, (user_id,))
 
-        cursor.close()
+        user = cur.fetchone()
+
+        cur.close()
         conn.close()
+
+        if not user:
+            print(
+                f"❌ JWT: пользователь "
+                f"id={user_id} не найден"
+            )
+            return None
+
+        print(
+            f"✅ JWT: @{user[1]} найден"
+        )
 
         return user
 
-    except Exception:
+    except jwt.ExpiredSignatureError:
+
+        print("❌ JWT: токен истёк")
+        return None
+
+    except jwt.InvalidTokenError as e:
+
+        print(
+            f"❌ JWT: недействительный токен: {e}"
+        )
+        return None
+
+    except Exception as e:
+
+        print(
+            f"❌ JWT ERROR: "
+            f"{type(e).__name__}: {e}"
+        )
+
         return None
 
 
-def get_user_by_username(username):
+def auth_user():
 
-    conn = get_db()
-    cursor = conn.cursor()
+    token = get_token_from_request()
 
-    user = cursor.execute(
-        """
-        SELECT
-            id,
-            username,
-            password_hash,
-            display_name
-        FROM users
-        WHERE username = %s
-        """,
-        [username]
-    ).fetchone()
+    if not token:
+        return None
 
-    cursor.close()
-    conn.close()
+    return get_user_by_token(token)
 
-    return user
 
+def auth_error():
+
+    return jsonify({
+        "success": False,
+        "message": "Токен недействителен"
+    }), 401
+
+
+# =========================================================
+# USERS
+# =========================================================
 
 def get_user_by_email(email):
 
     conn = get_db()
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
-    user = cursor.execute(
-        """
+    cur.execute("""
         SELECT
             id,
             username,
@@ -349,11 +319,38 @@ def get_user_by_email(email):
             email
         FROM users
         WHERE email = %s
-        """,
-        [email]
-    ).fetchone()
+    """, (email,))
 
-    cursor.close()
+    user = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    return user
+
+
+def get_user_by_username(username):
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    # ВАЖНО:
+    # email тоже возвращаем.
+    # Поэтому структура результата одинаковая.
+    cur.execute("""
+        SELECT
+            id,
+            username,
+            password_hash,
+            display_name,
+            email
+        FROM users
+        WHERE username = %s
+    """, (username,))
+
+    user = cur.fetchone()
+
+    cur.close()
     conn.close()
 
     return user
@@ -361,185 +358,247 @@ def get_user_by_email(email):
 
 def get_user_by_login(login):
 
-    if '@' in login:
-        return get_user_by_email(login)
+    user = get_user_by_email(login)
+
+    if user:
+        return user
 
     return get_user_by_username(login)
 
 
-# ============================================================
-# ADMIN
-# ============================================================
+# =========================================================
+# LOGIN ATTEMPTS
+# =========================================================
 
-def admin_required(f):
+def is_blocked(ip):
 
-    @wraps(f)
-    def decorated(*args, **kwargs):
+    conn = get_db()
+    cur = conn.cursor()
 
-        token = request.headers.get('Authorization')
+    cur.execute("""
+        SELECT attempts, last_attempt
+        FROM failed_attempts
+        WHERE ip = %s
+    """, (ip,))
 
-        if not token:
-            return jsonify({
-                "success": False,
-                "message": "Не авторизован"
-            }), 401
+    row = cur.fetchone()
 
-        token = token.replace('Bearer ', '')
+    cur.close()
+    conn.close()
 
-        user = get_user_by_token(token)
+    if not row:
+        return False
 
-        if not user or user[4] != 'admin':
-            return jsonify({
-                "success": False,
-                "message": "Нет прав"
-            }), 403
+    attempts, last_attempt = row
 
-        return f(*args, **kwargs)
+    if attempts < 5:
+        return False
 
-    return decorated
+    now = datetime.datetime.utcnow()
+
+    if now - last_attempt >= datetime.timedelta(minutes=5):
+
+        reset_attempts(ip)
+
+        return False
+
+    return True
 
 
-# ============================================================
-# HEALTH
-# ============================================================
+def record_failed_attempt(ip):
 
-@app.route('/api/health', methods=['GET'])
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO failed_attempts
+            (ip, attempts, last_attempt)
+        VALUES
+            (%s, 1, CURRENT_TIMESTAMP)
+
+        ON CONFLICT (ip)
+        DO UPDATE SET
+            attempts =
+                failed_attempts.attempts + 1,
+            last_attempt =
+                CURRENT_TIMESTAMP
+    """, (ip,))
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+
+def reset_attempts(ip):
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        DELETE FROM failed_attempts
+        WHERE ip = %s
+    """, (ip,))
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+@app.route("/")
+def home():
+
+    return jsonify({
+        "success": True,
+        "message": "Спокойный ум API работает"
+    })
+
+
+@app.route("/api/health")
 def health():
 
     return jsonify({
         "success": True,
-        "server": "online",
-        "websocket": True
+        "message": "Server is online"
     })
 
 
-# ============================================================
+# =========================================================
 # REGISTER
-# ============================================================
+# =========================================================
 
-@app.route('/api/register', methods=['POST'])
+@app.route("/api/register", methods=["POST"])
 def register():
-
-    data = request.get_json(silent=True) or {}
-
-    username = str(
-        data.get('username', '')
-    ).strip().lower()
-
-    password = str(
-        data.get('password', '')
-    )
-
-    display_name = str(
-        data.get('display_name', username)
-    )
-
-    email = str(
-        data.get('email', '')
-    ).strip().lower()
-
-    if not username or not password or not email:
-
-        return jsonify({
-            "success": False,
-            "message": "Заполните все поля"
-        }), 400
-
-    if len(password) < 8:
-
-        return jsonify({
-            "success": False,
-            "message": "Пароль минимум 8 символов"
-        }), 400
-
-    if not re.search(r'[A-Z]', password):
-
-        return jsonify({
-            "success": False,
-            "message": "Пароль должен содержать заглавную букву"
-        }), 400
-
-    if not re.search(r'\d', password):
-
-        return jsonify({
-            "success": False,
-            "message": "Пароль должен содержать цифру"
-        }), 400
-
-    if not re.match(
-        r'^[a-zA-Z0-9_]+$',
-        username
-    ):
-
-        return jsonify({
-            "success": False,
-            "message": "Юзернейм: только латиница, цифры и _"
-        }), 400
-
-    if '@' not in email:
-
-        return jsonify({
-            "success": False,
-            "message": "Введите корректный email"
-        }), 400
-
-    conn = get_db()
-    cursor = conn.cursor()
 
     try:
 
-        password_hash = bcrypt.hashpw(
-            password.encode('utf-8'),
-            bcrypt.gensalt()
+        data = get_json()
+
+        username = normalize(
+            data.get("username")
         )
 
-        cursor.execute(
-            """
-            INSERT INTO users
-            (
-                username,
-                password_hash,
-                display_name,
-                email
-            )
-            VALUES (%s, %s, %s, %s)
-            """,
-            [
-                username,
-                password_hash,
-                display_name,
-                email
-            ]
+        email = normalize(
+            data.get("email")
         )
+
+        password = str(
+            data.get("password") or ""
+        )
+
+        display_name = str(
+            data.get("display_name")
+            or data.get("displayName")
+            or username
+        ).strip()
+
+        if not username or not email or not password:
+
+            return jsonify({
+                "success": False,
+                "message": "Заполните все поля"
+            }), 400
+
+        if len(username) < 3:
+
+            return jsonify({
+                "success": False,
+                "message":
+                    "Логин должен содержать минимум 3 символа"
+            }), 400
+
+        if len(password) < 6:
+
+            return jsonify({
+                "success": False,
+                "message":
+                    "Пароль должен содержать минимум 6 символов"
+            }), 400
+
+        if get_user_by_username(username):
+
+            return jsonify({
+                "success": False,
+                "message":
+                    "Такой логин уже существует"
+            }), 409
+
+        if get_user_by_email(email):
+
+            return jsonify({
+                "success": False,
+                "message":
+                    "Такая почта уже зарегистрирована"
+            }), 409
+
+        password_hash = hash_password(password)
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO users
+                (
+                    username,
+                    password_hash,
+                    display_name,
+                    email
+                )
+            VALUES
+                (%s, %s, %s, %s)
+
+            RETURNING
+                id,
+                username,
+                display_name,
+                email,
+                role
+        """, (
+            username,
+            psycopg2.Binary(password_hash),
+            display_name,
+            email
+        ))
+
+        user = cur.fetchone()
 
         conn.commit()
 
-        cursor.close()
+        cur.close()
         conn.close()
 
+        token = create_token(
+            user[0],
+            user[1]
+        )
+
         return jsonify({
+
             "success": True,
-            "message": "Регистрация успешна!"
+
+            "token": token,
+
+            "user": {
+                "id": user[0],
+                "username": user[1],
+                "display_name": user[2],
+                "email": user[3],
+                "role": user[4]
+            }
+
         }), 201
-
-    except psycopg2.IntegrityError:
-
-        conn.rollback()
-        cursor.close()
-        conn.close()
-
-        return jsonify({
-            "success": False,
-            "message": "Пользователь или email уже существует"
-        }), 409
 
     except Exception as e:
 
-        conn.rollback()
-        cursor.close()
-        conn.close()
-
-        print(f"❌ Ошибка регистрации: {e}")
+        print(
+            f"❌ REGISTER ERROR: "
+            f"{type(e).__name__}: {e}"
+        )
 
         return jsonify({
             "success": False,
@@ -547,701 +606,623 @@ def register():
         }), 500
 
 
-# ============================================================
+# =========================================================
 # LOGIN
-# ============================================================
+# =========================================================
 
-@app.route('/api/login', methods=['POST'])
+@app.route("/api/login", methods=["POST"])
 def login():
-
-    ip = request.remote_addr
-
-    data = request.get_json(silent=True) or {}
-
-    login_value = str(
-        data.get('login', '')
-    ).strip().lower()
-
-    password = str(
-        data.get('password', '')
-    )
-
-    if not login_value or not password:
-
-        return jsonify({
-            "success": False,
-            "message": "Заполните все поля"
-        }), 400
-
-    if is_blocked(ip):
-
-        return jsonify({
-            "success": False,
-            "message": "Слишком много попыток. Подождите 5 минут."
-        }), 429
-
-    user = get_user_by_login(login_value)
-
-    if not user:
-
-        record_failed_attempt(ip)
-
-        return jsonify({
-            "success": False,
-            "message": "Пользователь не найден"
-        }), 401
-
-    # ========================================================
-    # FIX:
-    # PostgreSQL BYTEA возвращается как memoryview.
-    # bcrypt.checkpw() требует bytes.
-    # ========================================================
-
-    hashed_password = user[2]
-
-    if isinstance(
-        hashed_password,
-        memoryview
-    ):
-        hashed_password = hashed_password.tobytes()
-
-    elif isinstance(
-        hashed_password,
-        bytearray
-    ):
-        hashed_password = bytes(
-            hashed_password
-        )
-
-    elif isinstance(
-        hashed_password,
-        str
-    ):
-        hashed_password = hashed_password.encode(
-            'utf-8'
-        )
 
     try:
 
-        password_correct = bcrypt.checkpw(
-            password.encode('utf-8'),
-            hashed_password
+        ip = request.remote_addr or "unknown"
+
+        data = get_json()
+
+        login_value = normalize(
+            data.get("login")
+            or data.get("username")
+            or data.get("email")
         )
+
+        password = str(
+            data.get("password") or ""
+        )
+
+        if not login_value or not password:
+
+            return jsonify({
+                "success": False,
+                "message": "Заполните все поля"
+            }), 400
+
+        if is_blocked(ip):
+
+            return jsonify({
+                "success": False,
+                "message":
+                    "Слишком много попыток. "
+                    "Подождите 5 минут."
+            }), 429
+
+        user = get_user_by_login(
+            login_value
+        )
+
+        if not user:
+
+            record_failed_attempt(ip)
+
+            return jsonify({
+                "success": False,
+                "message": "Пользователь не найден"
+            }), 401
+
+        try:
+
+            correct = check_password(
+                password,
+                user[2]
+            )
+
+        except Exception as e:
+
+            print(
+                f"❌ BCRYPT ERROR: "
+                f"{type(e).__name__}: {e}"
+            )
+
+            return jsonify({
+                "success": False,
+                "message":
+                    "Ошибка проверки пароля"
+            }), 500
+
+        if not correct:
+
+            record_failed_attempt(ip)
+
+            return jsonify({
+                "success": False,
+                "message": "Неверный пароль"
+            }), 401
+
+        reset_attempts(ip)
+
+        token = create_token(
+            user[0],
+            user[1]
+        )
+
+        print(
+            f"✅ LOGIN: @{user[1]} вошёл"
+        )
+
+        return jsonify({
+
+            "success": True,
+
+            "token": token,
+
+            "user": {
+                "id": user[0],
+                "username": user[1],
+                "display_name": user[3],
+                "email": user[4]
+            }
+
+        })
 
     except Exception as e:
 
         print(
-            f"❌ Ошибка проверки пароля: {e}"
+            f"❌ LOGIN ERROR: "
+            f"{type(e).__name__}: {e}"
         )
 
         return jsonify({
             "success": False,
-            "message": "Ошибка проверки пароля"
+            "message": "Ошибка сервера"
         }), 500
 
-    if not password_correct:
 
-        record_failed_attempt(ip)
+# =========================================================
+# ME
+# =========================================================
 
-        return jsonify({
-            "success": False,
-            "message": "Неверный пароль"
-        }), 401
+@app.route("/api/me", methods=["GET"])
+def me():
 
-    reset_attempts(ip)
+    user = auth_user()
 
-    token = jwt.encode(
-        {
-            "user_id": user[0],
-            "username": user[1],
-            "exp": datetime.datetime.utcnow()
-            + datetime.timedelta(days=7)
-        },
-        SECRET_KEY,
-        algorithm="HS256"
-    )
+    if not user:
+        return auth_error()
 
     return jsonify({
+
         "success": True,
-        "token": token,
+
         "user": {
             "id": user[0],
             "username": user[1],
-            "display_name": user[3],
-            "email": user[4]
+            "display_name": user[2],
+            "email": user[3],
+            "role": user[4]
         }
-    }), 200
 
-
-# ============================================================
-# PASSWORD RECOVERY
-# ============================================================
-
-@app.route('/api/recover', methods=['POST'])
-def recover_password():
-
-    data = request.get_json(silent=True) or {}
-
-    email = str(
-        data.get('email', '')
-    ).strip().lower()
-
-    if not email:
-
-        return jsonify({
-            "success": False,
-            "message": "Введите email"
-        }), 400
-
-    user = get_user_by_email(email)
-
-    if not user:
-
-        return jsonify({
-            "success": False,
-            "message": "Пользователь с таким email не найден"
-        }), 404
-
-    return jsonify({
-        "success": True,
-        "message": (
-            "Ссылка для сброса пароля отправлена "
-            "на почту (демо: код 123456)"
-        ),
-        "code": "123456"
     })
 
 
-# ============================================================
-# USERS
-# ============================================================
+# =========================================================
+# USERS / SEARCH
+# =========================================================
 
-@app.route('/api/users', methods=['GET'])
-def get_users():
+@app.route("/api/users", methods=["GET"])
+def users():
+
+    user = auth_user()
+
+    if not user:
+        return auth_error()
+
+    search = normalize(
+        request.args.get("search")
+    )
 
     conn = get_db()
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
-    users = cursor.execute(
-        """
+    if search:
+
+        cur.execute("""
+            SELECT
+                id,
+                username,
+                display_name,
+                email,
+                role
+            FROM users
+            WHERE
+                username ILIKE %s
+                OR display_name ILIKE %s
+            ORDER BY username
+            LIMIT 50
+        """, (
+            f"%{search}%",
+            f"%{search}%"
+        ))
+
+    else:
+
+        cur.execute("""
+            SELECT
+                id,
+                username,
+                display_name,
+                email,
+                role
+            FROM users
+            ORDER BY username
+            LIMIT 50
+        """)
+
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return jsonify({
+
+        "success": True,
+
+        "users": [
+
+            {
+                "id": row[0],
+                "username": row[1],
+                "display_name": row[2],
+                "email": row[3],
+                "role": row[4]
+            }
+
+            for row in rows
+        ]
+
+    })
+
+
+@app.route("/api/search", methods=["GET"])
+def search():
+
+    user = auth_user()
+
+    if not user:
+        return auth_error()
+
+    query = normalize(
+        request.args.get("q")
+    )
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
         SELECT
+            id,
             username,
             display_name,
-            email
+            email,
+            role
         FROM users
-        ORDER BY id
-        """
-    ).fetchall()
+        WHERE
+            username ILIKE %s
+            OR display_name ILIKE %s
+            OR email ILIKE %s
+        ORDER BY username
+        LIMIT 50
+    """, (
+        f"%{query}%",
+        f"%{query}%",
+        f"%{query}%"
+    ))
 
-    cursor.close()
+    rows = cur.fetchall()
+
+    cur.close()
     conn.close()
 
-    result = []
+    return jsonify({
 
-    for u in users:
+        "success": True,
 
-        result.append({
-            "username": u[0],
-            "display_name": u[1],
-            "email": u[2]
-        })
+        "users": [
 
-    return jsonify(result)
+            {
+                "id": row[0],
+                "username": row[1],
+                "display_name": row[2],
+                "email": row[3],
+                "role": row[4]
+            }
+
+            for row in rows
+        ]
+
+    })
 
 
-# ============================================================
+# =========================================================
 # POSTS
-# ============================================================
+# =========================================================
 
-@app.route('/api/posts', methods=['GET'])
+@app.route("/api/posts", methods=["GET"])
 def get_posts():
 
-    conn = get_db()
-    cursor = conn.cursor()
-
-    posts = cursor.execute(
-        '''
-        SELECT
-            users.username,
-            users.display_name,
-            posts.text,
-            posts.mood,
-            posts.media,
-            posts.time,
-            posts.id
-        FROM posts
-        JOIN users
-            ON posts.user_id = users.id
-        ORDER BY posts.time DESC
-        '''
-    ).fetchall()
-
-    cursor.close()
-    conn.close()
-
-    result = []
-
-    for p in posts:
-
-        try:
-            media = json.loads(p[4]) if p[4] else []
-        except Exception:
-            media = []
-
-        result.append({
-            "username": p[0],
-            "display_name": p[1],
-            "text": p[2],
-            "mood": p[3] or '·',
-            "media": media,
-            "time": p[5],
-            "id": p[6],
-            "likes": 0
-        })
-
-    return jsonify(result)
-
-
-@app.route('/api/posts', methods=['POST'])
-def create_post():
-
-    token = request.headers.get(
-        'Authorization'
-    )
-
-    if not token:
-
-        return jsonify({
-            "success": False,
-            "message": "Не авторизован"
-        }), 401
-
-    token = token.replace(
-        'Bearer ',
-        ''
-    )
-
-    user = get_user_by_token(token)
+    user = auth_user()
 
     if not user:
+        return auth_error()
 
-        return jsonify({
-            "success": False,
-            "message": "Неверный токен"
-        }), 401
+    conn = get_db()
+    cur = conn.cursor()
 
-    data = request.get_json(silent=True) or {}
+    cur.execute("""
+        SELECT
+            p.id,
+            p.user_id,
+            u.username,
+            u.display_name,
+            p.content,
+            p.created_at,
+            COUNT(l.id)
+        FROM posts p
 
-    text = str(
-        data.get('text', '')
+        JOIN users u
+            ON u.id = p.user_id
+
+        LEFT JOIN likes l
+            ON l.post_id = p.id
+
+        GROUP BY
+            p.id,
+            p.user_id,
+            u.username,
+            u.display_name,
+            p.content,
+            p.created_at
+
+        ORDER BY p.created_at DESC
+
+        LIMIT 100
+    """)
+
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return jsonify({
+
+        "success": True,
+
+        "posts": [
+
+            {
+                "id": row[0],
+                "user_id": row[1],
+                "username": row[2],
+                "display_name": row[3],
+                "content": row[4],
+                "created_at":
+                    row[5].isoformat()
+                    if row[5] else None,
+                "likes": row[6]
+            }
+
+            for row in rows
+        ]
+
+    })
+
+
+@app.route("/api/posts", methods=["POST"])
+def create_post():
+
+    user = auth_user()
+
+    if not user:
+        return auth_error()
+
+    data = get_json()
+
+    content = str(
+        data.get("content") or ""
     ).strip()
 
-    mood = data.get(
-        'mood',
-        '·'
-    )
-
-    if not text:
+    if not content:
 
         return jsonify({
             "success": False,
-            "message": "Напишите что-нибудь"
+            "message": "Введите текст"
+        }), 400
+
+    if len(content) > 5000:
+
+        return jsonify({
+            "success": False,
+            "message": "Пост слишком длинный"
         }), 400
 
     conn = get_db()
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
-    cursor.execute(
-        """
+    cur.execute("""
         INSERT INTO posts
-        (
-            user_id,
-            text,
-            mood
-        )
-        VALUES (%s, %s, %s)
-        """,
-        [
-            user[0],
-            text,
-            mood
-        ]
-    )
+            (user_id, content)
+        VALUES
+            (%s, %s)
+        RETURNING id, created_at
+    """, (
+        user[0],
+        content
+    ))
+
+    post_id, created_at = cur.fetchone()
 
     conn.commit()
 
-    cursor.close()
+    cur.close()
     conn.close()
 
     return jsonify({
+
         "success": True,
-        "message": "Пост опубликован"
-    })
+
+        "post": {
+            "id": post_id,
+            "user_id": user[0],
+            "username": user[1],
+            "display_name": user[2],
+            "content": content,
+            "created_at":
+                created_at.isoformat()
+        }
+
+    }), 201
 
 
-@app.route('/api/posts/<int:post_id>', methods=['DELETE'])
-def delete_post(post_id):
-
-    token = request.headers.get(
-        'Authorization'
-    )
-
-    if not token:
-
-        return jsonify({
-            "success": False,
-            "message": "Не авторизован"
-        }), 401
-
-    token = token.replace(
-        'Bearer ',
-        ''
-    )
-
-    user = get_user_by_token(token)
-
-    if not user:
-
-        return jsonify({
-            "success": False,
-            "message": "Неверный токен"
-        }), 401
-
-    conn = get_db()
-    cursor = conn.cursor()
-
-    post = cursor.execute(
-        """
-        SELECT user_id
-        FROM posts
-        WHERE id = %s
-        """,
-        [post_id]
-    ).fetchone()
-
-    if not post or post[0] != user[0]:
-
-        cursor.close()
-        conn.close()
-
-        return jsonify({
-            "success": False,
-            "message": "Нельзя удалить чужой пост"
-        }), 403
-
-    cursor.execute(
-        """
-        DELETE FROM posts
-        WHERE id = %s
-        """,
-        [post_id]
-    )
-
-    conn.commit()
-
-    cursor.close()
-    conn.close()
-
-    return jsonify({
-        "success": True,
-        "message": "Пост удалён"
-    })
-
-
-# ============================================================
-# LIKES
-# ============================================================
-
-@app.route('/api/posts/<int:post_id>/like', methods=['POST'])
+@app.route(
+    "/api/posts/<int:post_id>/like",
+    methods=["POST"]
+)
 def like_post(post_id):
 
-    token = request.headers.get(
-        'Authorization'
-    )
-
-    if not token:
-
-        return jsonify({
-            "success": False,
-            "message": "Не авторизован"
-        }), 401
-
-    token = token.replace(
-        'Bearer ',
-        ''
-    )
-
-    user = get_user_by_token(token)
+    user = auth_user()
 
     if not user:
-
-        return jsonify({
-            "success": False,
-            "message": "Неверный токен"
-        }), 401
+        return auth_error()
 
     conn = get_db()
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
-    existing = cursor.execute(
-        """
-        SELECT *
+    cur.execute("""
+        SELECT id
         FROM likes
-        WHERE post_id = %s
-        AND user_id = %s
-        """,
-        [
-            post_id,
-            user[0]
-        ]
-    ).fetchone()
+        WHERE
+            post_id = %s
+            AND user_id = %s
+    """, (
+        post_id,
+        user[0]
+    ))
+
+    existing = cur.fetchone()
 
     if existing:
 
-        cursor.execute(
-            """
+        cur.execute("""
             DELETE FROM likes
-            WHERE post_id = %s
-            AND user_id = %s
-            """,
-            [
-                post_id,
-                user[0]
-            ]
-        )
+            WHERE id = %s
+        """, (existing[0],))
 
-        conn.commit()
+        liked = False
 
-        cursor.close()
-        conn.close()
+    else:
 
-        return jsonify({
-            "success": True,
-            "liked": False
-        })
-
-    cursor.execute(
-        """
-        INSERT INTO likes
-        (
-            post_id,
-            user_id
-        )
-        VALUES (%s, %s)
-        """,
-        [
+        cur.execute("""
+            INSERT INTO likes
+                (post_id, user_id)
+            VALUES
+                (%s, %s)
+            ON CONFLICT DO NOTHING
+        """, (
             post_id,
             user[0]
-        ]
-    )
+        ))
+
+        liked = True
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM likes
+        WHERE post_id = %s
+    """, (post_id,))
+
+    count = cur.fetchone()[0]
 
     conn.commit()
 
-    cursor.close()
+    cur.close()
     conn.close()
 
     return jsonify({
+
         "success": True,
-        "liked": True
+        "liked": liked,
+        "likes": count
+
     })
 
 
-# ============================================================
+# =========================================================
 # CHATS
-# ============================================================
+# =========================================================
 
-@app.route('/api/chats', methods=['GET'])
+@app.route("/api/chats", methods=["GET"])
 def get_chats():
 
-    token = request.headers.get(
-        'Authorization'
-    )
-
-    if not token:
-
-        return jsonify({
-            "success": False,
-            "message": "Не авторизован"
-        }), 401
-
-    token = token.replace(
-        'Bearer ',
-        ''
-    )
-
-    user = get_user_by_token(token)
+    user = auth_user()
 
     if not user:
-
-        return jsonify({
-            "success": False,
-            "message": "Неверный токен"
-        }), 401
+        return auth_error()
 
     conn = get_db()
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
-    cursor.execute(
-        '''
-        SELECT DISTINCT
+    cur.execute("""
+        SELECT
+            c.id,
+
             CASE
-                WHEN from_user = %s
-                THEN to_user
-                ELSE from_user
-            END
-        FROM messages
-        WHERE from_user = %s
-        OR to_user = %s
-        ''',
-        [
-            user[1],
-            user[1],
-            user[1]
-        ]
-    )
+                WHEN c.user1_id = %s
+                THEN c.user2_id
+                ELSE c.user1_id
+            END,
 
-    partners = cursor.fetchall()
+            u.username,
+            u.display_name
 
-    result = []
+        FROM chats c
 
-    for p in partners:
+        JOIN users u
+            ON u.id =
+                CASE
+                    WHEN c.user1_id = %s
+                    THEN c.user2_id
+                    ELSE c.user1_id
+                END
 
-        partner = p[0]
+        WHERE
+            c.user1_id = %s
+            OR c.user2_id = %s
 
-        last = cursor.execute(
-            '''
-            SELECT
-                text,
-                time
-            FROM messages
-            WHERE
-                (
-                    from_user = %s
-                    AND to_user = %s
-                )
-                OR
-                (
-                    from_user = %s
-                    AND to_user = %s
-                )
-            ORDER BY time DESC
-            LIMIT 1
-            ''',
-            [
-                user[1],
-                partner,
-                partner,
-                user[1]
-            ]
-        ).fetchone()
+        ORDER BY c.created_at DESC
+    """, (
+        user[0],
+        user[0],
+        user[0],
+        user[0]
+    ))
 
-        unread = cursor.execute(
-            '''
-            SELECT COUNT(*)
-            FROM messages
-            WHERE
-                from_user = %s
-                AND to_user = %s
-                AND read = FALSE
-            ''',
-            [
-                partner,
-                user[1]
-            ]
-        ).fetchone()[0]
+    rows = cur.fetchall()
 
-        result.append({
-            "username": partner,
-            "last_message": (
-                last[0]
-                if last
-                else ''
-            ),
-            "last_time": (
-                last[1]
-                if last
-                else None
-            ),
-            "unread": unread
-        })
-
-    cursor.close()
+    cur.close()
     conn.close()
 
-    return jsonify(result)
+    return jsonify({
+
+        "success": True,
+
+        "chats": [
+
+            {
+                "id": row[0],
+                "user_id": row[1],
+                "username": row[2],
+                "display_name": row[3]
+            }
+
+            for row in rows
+        ]
+
+    })
 
 
-# ============================================================
-# SEND MESSAGE
-# ============================================================
+@app.route("/api/chats", methods=["POST"])
+def create_chat():
 
-@app.route('/api/messages', methods=['POST'])
-def send_message():
-
-    token = request.headers.get(
-        'Authorization'
-    )
-
-    if not token:
-
-        return jsonify({
-            "success": False,
-            "message": "Не авторизован"
-        }), 401
-
-    token = token.replace(
-        'Bearer ',
-        ''
-    )
-
-    user = get_user_by_token(token)
+    user = auth_user()
 
     if not user:
+        return auth_error()
 
+    data = get_json()
+
+    try:
+        other_user_id = int(
+            data.get("user_id")
+        )
+    except:
         return jsonify({
             "success": False,
-            "message": "Неверный токен"
-        }), 401
-
-    data = request.get_json(silent=True) or {}
-
-    to_user = str(
-        data.get('to_user', '')
-    ).strip().lower()
-
-    text = str(
-        data.get('text', '')
-    ).strip()
-
-    if not to_user or not text:
-
-        return jsonify({
-            "success": False,
-            "message": "Заполните все поля"
+            "message": "Неверный user_id"
         }), 400
 
-    if len(text) > 5000:
+    if other_user_id == user[0]:
 
         return jsonify({
             "success": False,
-            "message": "Сообщение слишком длинное"
+            "message":
+                "Нельзя создать чат с самим собой"
         }), 400
 
     conn = get_db()
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
-    receiver = cursor.execute(
-        """
-        SELECT username
+    cur.execute("""
+        SELECT
+            id,
+            username,
+            display_name
         FROM users
-        WHERE username = %s
-        """,
-        [to_user]
-    ).fetchone()
+        WHERE id = %s
+    """, (other_user_id,))
 
-    if not receiver:
+    other = cur.fetchone()
 
-        cursor.close()
+    if not other:
+
+        cur.close()
         conn.close()
 
         return jsonify({
@@ -1249,60 +1230,329 @@ def send_message():
             "message": "Пользователь не найден"
         }), 404
 
-    cursor.execute(
-        """
-        INSERT INTO messages
-        (
-            from_user,
-            to_user,
-            text
-        )
-        VALUES (%s, %s, %s)
-        RETURNING id
-        """,
-        (
-            user[1],
-            to_user,
-            text
-        )
-    )
+    cur.execute("""
+        SELECT id
+        FROM chats
+        WHERE
+            (
+                user1_id = %s
+                AND user2_id = %s
+            )
+            OR
+            (
+                user1_id = %s
+                AND user2_id = %s
+            )
+        LIMIT 1
+    """, (
+        user[0],
+        other_user_id,
+        other_user_id,
+        user[0]
+    ))
 
-    message_id = cursor.fetchone()[0]
+    chat = cur.fetchone()
 
-    row = cursor.execute(
-        """
-        SELECT
-            id,
-            from_user,
-            to_user,
-            text,
-            time,
-            read
-        FROM messages
-        WHERE id = %s
-        """,
-        [message_id]
-    ).fetchone()
+    if chat:
+
+        chat_id = chat[0]
+
+    else:
+
+        cur.execute("""
+            INSERT INTO chats
+                (user1_id, user2_id)
+            VALUES
+                (%s, %s)
+            RETURNING id
+        """, (
+            user[0],
+            other_user_id
+        ))
+
+        chat_id = cur.fetchone()[0]
 
     conn.commit()
 
-    cursor.close()
+    cur.close()
+    conn.close()
+
+    return jsonify({
+
+        "success": True,
+
+        "chat": {
+            "id": chat_id,
+            "user_id": other[0],
+            "username": other[1],
+            "display_name": other[2]
+        }
+
+    })
+
+
+# =========================================================
+# MESSAGES
+# =========================================================
+
+@app.route("/api/messages", methods=["GET"])
+def get_messages():
+
+    user = auth_user()
+
+    if not user:
+        return auth_error()
+
+    try:
+        other_user_id = int(
+            request.args.get("user_id")
+        )
+    except:
+
+        return jsonify({
+            "success": False,
+            "message": "Неверный user_id"
+        }), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            m.id,
+            m.sender_id,
+            su.username,
+            su.display_name,
+            m.receiver_id,
+            ru.username,
+            ru.display_name,
+            m.content,
+            m.created_at
+
+        FROM messages m
+
+        JOIN users su
+            ON su.id = m.sender_id
+
+        JOIN users ru
+            ON ru.id = m.receiver_id
+
+        WHERE
+            (
+                m.sender_id = %s
+                AND m.receiver_id = %s
+            )
+            OR
+            (
+                m.sender_id = %s
+                AND m.receiver_id = %s
+            )
+
+        ORDER BY m.created_at ASC
+
+        LIMIT 500
+    """, (
+        user[0],
+        other_user_id,
+        other_user_id,
+        user[0]
+    ))
+
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return jsonify({
+
+        "success": True,
+
+        "messages": [
+
+            {
+                "id": row[0],
+                "sender_id": row[1],
+                "sender_username": row[2],
+                "sender_display_name": row[3],
+                "receiver_id": row[4],
+                "receiver_username": row[5],
+                "receiver_display_name": row[6],
+                "content": row[7],
+                "created_at":
+                    row[8].isoformat()
+                    if row[8] else None
+            }
+
+            for row in rows
+        ]
+
+    })
+
+
+@app.route("/api/messages", methods=["POST"])
+def send_message():
+
+    user = auth_user()
+
+    if not user:
+        return auth_error()
+
+    data = get_json()
+
+    try:
+        receiver_id = int(
+            data.get("receiver_id")
+        )
+    except:
+
+        return jsonify({
+            "success": False,
+            "message": "Неверный receiver_id"
+        }), 400
+
+    content = str(
+        data.get("content") or ""
+    ).strip()
+
+    if not content:
+
+        return jsonify({
+            "success": False,
+            "message": "Сообщение пустое"
+        }), 400
+
+    if len(content) > 5000:
+
+        return jsonify({
+            "success": False,
+            "message":
+                "Сообщение слишком длинное"
+        }), 400
+
+    if receiver_id == user[0]:
+
+        return jsonify({
+            "success": False,
+            "message":
+                "Нельзя написать самому себе"
+        }), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            id,
+            username,
+            display_name
+        FROM users
+        WHERE id = %s
+    """, (receiver_id,))
+
+    receiver = cur.fetchone()
+
+    if not receiver:
+
+        cur.close()
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "message": "Получатель не найден"
+        }), 404
+
+    # Создаём чат, если его ещё нет
+    cur.execute("""
+        SELECT id
+        FROM chats
+        WHERE
+            (
+                user1_id = %s
+                AND user2_id = %s
+            )
+            OR
+            (
+                user1_id = %s
+                AND user2_id = %s
+            )
+        LIMIT 1
+    """, (
+        user[0],
+        receiver_id,
+        receiver_id,
+        user[0]
+    ))
+
+    chat = cur.fetchone()
+
+    if chat:
+
+        chat_id = chat[0]
+
+    else:
+
+        cur.execute("""
+            INSERT INTO chats
+                (user1_id, user2_id)
+            VALUES
+                (%s, %s)
+            RETURNING id
+        """, (
+            user[0],
+            receiver_id
+        ))
+
+        chat_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO messages
+            (
+                sender_id,
+                receiver_id,
+                content
+            )
+        VALUES
+            (%s, %s, %s)
+
+        RETURNING id, created_at
+    """, (
+        user[0],
+        receiver_id,
+        content
+    ))
+
+    message_id, created_at = cur.fetchone()
+
+    conn.commit()
+
+    cur.close()
     conn.close()
 
     message = {
-        "id": row[0],
-        "from": row[1],
-        "to": row[2],
-        "text": row[3],
-        "time": row[4],
-        "read": bool(row[5])
+
+        "id": message_id,
+
+        "chat_id": chat_id,
+
+        "sender_id": user[0],
+        "sender_username": user[1],
+        "sender_display_name": user[2],
+
+        "receiver_id": receiver_id,
+        "receiver_username": receiver[1],
+        "receiver_display_name": receiver[2],
+
+        "content": content,
+
+        "created_at":
+            created_at.isoformat()
     }
 
-    # Real-time
+    # Отправляем сообщение через Socket.IO
     socketio.emit(
         "new_message",
         message,
-        room=to_user
+        room=receiver[1]
     )
 
     socketio.emit(
@@ -1312,561 +1562,328 @@ def send_message():
     )
 
     return jsonify({
+
         "success": True,
-        "message": "Сообщение отправлено",
-        "data": message
-    })
+
+        "message": message
+
+    }), 201
 
 
-# ============================================================
-# GET MESSAGES
-# ============================================================
-
-@app.route('/api/messages/<username>', methods=['GET'])
-def get_messages(username):
-
-    token = request.headers.get(
-        'Authorization'
-    )
-
-    if not token:
-
-        return jsonify({
-            "success": False,
-            "message": "Не авторизован"
-        }), 401
-
-    token = token.replace(
-        'Bearer ',
-        ''
-    )
-
-    user = get_user_by_token(token)
-
-    if not user:
-
-        return jsonify({
-            "success": False,
-            "message": "Неверный токен"
-        }), 401
-
-    username = username.strip().lower()
-
-    conn = get_db()
-    cursor = conn.cursor()
-
-    messages = cursor.execute(
-        '''
-        SELECT
-            id,
-            from_user,
-            to_user,
-            text,
-            time,
-            read
-        FROM messages
-        WHERE
-            (
-                from_user = %s
-                AND to_user = %s
-            )
-            OR
-            (
-                from_user = %s
-                AND to_user = %s
-            )
-        ORDER BY id ASC
-        ''',
-        [
-            user[1],
-            username,
-            username,
-            user[1]
-        ]
-    ).fetchall()
-
-    result = []
-
-    for m in messages:
-
-        result.append({
-            "id": m[0],
-            "from": m[1],
-            "to": m[2],
-            "text": m[3],
-            "time": m[4],
-            "read": bool(m[5])
-        })
-
-    cursor.execute(
-        """
-        UPDATE messages
-        SET read = TRUE
-        WHERE
-            from_user = %s
-            AND to_user = %s
-        """,
-        [
-            username,
-            user[1]
-        ]
-    )
-
-    conn.commit()
-
-    cursor.close()
-    conn.close()
-
-    return jsonify(result)
-
-
-# ============================================================
+# =========================================================
 # MOOD
-# ============================================================
+# =========================================================
 
-@app.route('/api/mood', methods=['POST'])
+@app.route("/api/mood", methods=["POST"])
 def save_mood():
 
-    data = request.get_json(silent=True) or {}
+    user = auth_user()
 
-    username = str(
-        data.get('username', '')
-    ).strip().lower()
+    if not user:
+        return auth_error()
+
+    data = get_json()
 
     mood = str(
-        data.get('mood', '')
-    )
-
-    if not username or not mood:
-
-        return jsonify({
-            "success": False,
-            "message": "Заполните все поля"
-        }), 400
-
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        INSERT INTO moods
-        (
-            username,
-            mood,
-            date
-        )
-        VALUES
-        (
-            %s,
-            %s,
-            CURRENT_DATE
-        )
-        ON CONFLICT
-        (
-            username,
-            date
-        )
-        DO UPDATE
-        SET mood = EXCLUDED.mood
-        """,
-        [
-            username,
-            mood
-        ]
-    )
-
-    conn.commit()
-
-    cursor.close()
-    conn.close()
-
-    return jsonify({
-        "success": True,
-        "message": "Состояние сохранено"
-    })
-
-
-@app.route('/api/mood/<username>', methods=['GET'])
-def get_mood(username):
-
-    conn = get_db()
-    cursor = conn.cursor()
-
-    mood = cursor.execute(
-        """
-        SELECT mood
-        FROM moods
-        WHERE
-            username = %s
-            AND date = CURRENT_DATE
-        """,
-        [username]
-    ).fetchone()
-
-    cursor.close()
-    conn.close()
-
-    return jsonify({
-        "mood": mood[0]
-        if mood
-        else None
-    })
-
-
-# ============================================================
-# GRATITUDE
-# ============================================================
-
-@app.route('/api/gratitude', methods=['POST'])
-def save_gratitude():
-
-    data = request.get_json(silent=True) or {}
-
-    username = str(
-        data.get('username', '')
-    ).strip().lower()
-
-    text = str(
-        data.get('text', '')
+        data.get("mood") or ""
     ).strip()
 
-    if not username or not text:
+    if not mood:
 
         return jsonify({
             "success": False,
-            "message": "Заполните все поля"
+            "message":
+                "Укажите настроение"
         }), 400
 
     conn = get_db()
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
-    cursor.execute(
-        """
-        INSERT INTO gratitude
-        (
-            username,
-            text
-        )
-        VALUES (%s, %s)
-        """,
-        [
-            username,
-            text
-        ]
-    )
+    cur.execute("""
+        INSERT INTO moods
+            (user_id, mood)
+        VALUES
+            (%s, %s)
+
+        RETURNING id, created_at
+    """, (
+        user[0],
+        mood
+    ))
+
+    row = cur.fetchone()
 
     conn.commit()
 
-    cursor.close()
+    cur.close()
     conn.close()
 
     return jsonify({
+
         "success": True,
-        "message": "Благодарность сохранена"
+
+        "mood": {
+            "id": row[0],
+            "mood": mood,
+            "created_at":
+                row[1].isoformat()
+        }
+
     })
 
 
-@app.route('/api/gratitude/<username>', methods=['GET'])
-def get_gratitude(username):
+# =========================================================
+# GRATITUDE
+# =========================================================
 
-    conn = get_db()
-    cursor = conn.cursor()
+@app.route("/api/gratitude", methods=["POST"])
+def save_gratitude():
 
-    entries = cursor.execute(
-        """
-        SELECT
-            text,
-            date
-        FROM gratitude
-        WHERE username = %s
-        ORDER BY date DESC
-        LIMIT 10
-        """,
-        [username]
-    ).fetchall()
-
-    cursor.close()
-    conn.close()
-
-    return jsonify([
-        {
-            "text": e[0],
-            "date": e[1]
-        }
-        for e in entries
-    ])
-
-
-# ============================================================
-# SEARCH
-# ============================================================
-
-@app.route('/api/search', methods=['GET'])
-def search_users():
-
-    query = request.args.get(
-        'q',
-        ''
-    ).strip().lower()
-
-    if not query:
-        return jsonify([])
-
-    conn = get_db()
-    cursor = conn.cursor()
-
-    users = cursor.execute(
-        """
-        SELECT
-            username,
-            display_name,
-            email
-        FROM users
-        WHERE
-            username LIKE %s
-            OR display_name LIKE %s
-        LIMIT 10
-        """,
-        [
-            f'%{query}%',
-            f'%{query}%'
-        ]
-    ).fetchall()
-
-    cursor.close()
-    conn.close()
-
-    result = []
-
-    for u in users:
-
-        result.append({
-            "username": u[0],
-            "display_name": u[1],
-            "email": u[2]
-        })
-
-    return jsonify(result)
-
-
-# ============================================================
-# CURRENT USER
-# ============================================================
-
-@app.route('/api/me', methods=['GET'])
-def get_me():
-
-    token = request.headers.get(
-        'Authorization'
-    )
-
-    if not token:
-
-        return jsonify({
-            "error": "Не авторизован"
-        }), 401
-
-    token = token.replace(
-        'Bearer ',
-        ''
-    )
-
-    user = get_user_by_token(token)
+    user = auth_user()
 
     if not user:
+        return auth_error()
+
+    data = get_json()
+
+    content = str(
+        data.get("content") or ""
+    ).strip()
+
+    if not content:
 
         return jsonify({
-            "error": "Неверный токен"
-        }), 401
+            "success": False,
+            "message": "Введите текст"
+        }), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO gratitude
+            (user_id, content)
+        VALUES
+            (%s, %s)
+
+        RETURNING id, created_at
+    """, (
+        user[0],
+        content
+    ))
+
+    row = cur.fetchone()
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
 
     return jsonify({
-        "id": user[0],
-        "username": user[1],
-        "display_name": user[2],
-        "email": user[3]
+
+        "success": True,
+
+        "gratitude": {
+            "id": row[0],
+            "content": content,
+            "created_at":
+                row[1].isoformat()
+        }
+
     })
 
 
-# ============================================================
-# ADMIN - MODERATOR
-# ============================================================
+# =========================================================
+# ADMIN
+# =========================================================
 
 @app.route(
-    '/api/admin/make_moderator',
-    methods=['POST']
+    "/api/admin/moderator",
+    methods=["POST"]
 )
-@admin_required
 def make_moderator():
 
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    username = str(
-        data.get('username', '')
-    ).strip().lower()
-
-    if not username:
-
-        return jsonify({
-            "success": False,
-            "message": "Укажите пользователя"
-        }), 400
-
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        UPDATE users
-        SET role = 'moderator'
-        WHERE username = %s
-        """,
-        [username]
-    )
-
-    conn.commit()
-
-    cursor.close()
-    conn.close()
-
-    return jsonify({
-        "success": True,
-        "message": (
-            f"{username} теперь модератор"
-        )
-    })
-
-
-# ============================================================
-# ADMIN - BAN
-# ============================================================
-
-@app.route(
-    '/api/admin/ban',
-    methods=['POST']
-)
-@admin_required
-def ban_user():
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    username = str(
-        data.get('username', '')
-    ).strip().lower()
-
-    if not username:
-
-        return jsonify({
-            "success": False,
-            "message": "Укажите пользователя"
-        }), 400
-
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        UPDATE users
-        SET role = 'banned'
-        WHERE username = %s
-        """,
-        [username]
-    )
-
-    conn.commit()
-
-    cursor.close()
-    conn.close()
-
-    return jsonify({
-        "success": True,
-        "message": (
-            f"{username} забанен"
-        )
-    })
-
-
-# ============================================================
-# SOCKET.IO
-# ============================================================
-
-@socketio.on('connect')
-def socket_connect(auth):
-
-    if not auth or not auth.get('token'):
-        return False
-
-    user = get_user_by_token(
-        auth['token']
-    )
+    user = auth_user()
 
     if not user:
+        return auth_error()
+
+    if user[4] != "admin":
+
+        return jsonify({
+            "success": False,
+            "message":
+                "Недостаточно прав"
+        }), 403
+
+    data = get_json()
+
+    try:
+        target_id = int(
+            data.get("user_id")
+        )
+    except:
+
+        return jsonify({
+            "success": False,
+            "message": "Неверный user_id"
+        }), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE users
+
+        SET role = 'moderator'
+
+        WHERE id = %s
+
+        RETURNING
+            id,
+            username,
+            role
+    """, (target_id,))
+
+    result = cur.fetchone()
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+    if not result:
+
+        return jsonify({
+            "success": False,
+            "message":
+                "Пользователь не найден"
+        }), 404
+
+    return jsonify({
+
+        "success": True,
+
+        "user": {
+            "id": result[0],
+            "username": result[1],
+            "role": result[2]
+        }
+
+    })
+
+
+# =========================================================
+# SOCKET.IO
+# =========================================================
+
+connected_users = {}
+
+
+@socketio.on("connect")
+def socket_connect(auth):
+
+    try:
+
+        token = None
+
+        if isinstance(auth, dict):
+            token = auth.get("token")
+
+        user = get_user_by_token(token)
+
+        if not user:
+
+            print(
+                "❌ SOCKET: неверный токен"
+            )
+
+            return False
+
+        username = user[1]
+
+        join_room(username)
+
+        connected_users[username] = request.sid
+
+        print(
+            f"🟢 SOCKET: @{username} подключился"
+        )
+
+        emit(
+            "connected",
+            {
+                "success": True,
+                "username": username
+            }
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            f"❌ SOCKET ERROR: "
+            f"{type(e).__name__}: {e}"
+        )
+
         return False
 
-    join_room(
-        user[1]
-    )
 
-    emit(
-        'connected',
-        {
-            'success': True,
-            'username': user[1]
-        }
-    )
-
-    print(
-        f"🟢 WebSocket подключён: @{user[1]}"
-    )
-
-
-@socketio.on('disconnect')
+@socketio.on("disconnect")
 def socket_disconnect():
 
+    try:
+
+        for username, sid in list(
+            connected_users.items()
+        ):
+
+            if sid == request.sid:
+
+                del connected_users[username]
+
+                print(
+                    f"🔴 SOCKET: @{username} отключился"
+                )
+
+                break
+
+    except Exception as e:
+
+        print(
+            f"SOCKET DISCONNECT ERROR: "
+            f"{type(e).__name__}: {e}"
+        )
+
+
+# =========================================================
+# START
+# =========================================================
+
+try:
+
+    init_db()
+
+except Exception as e:
+
     print(
-        "🔴 WebSocket отключён"
+        f"❌ DATABASE ERROR: "
+        f"{type(e).__name__}: {e}"
     )
 
 
-# ============================================================
-# INIT DATABASE
-# ============================================================
-
-init_db()
-
-
-# ============================================================
-# START SERVER
-# ============================================================
-
-if __name__ == '__main__':
+if __name__ == "__main__":
 
     port = int(
         os.environ.get(
             "PORT",
-            5000
+            10000
         )
-    )
-
-    print(
-        f"🚀 Сервер запущен на "
-        f"http://0.0.0.0:{port}"
-    )
-
-    print(
-        "📡 API доступны по адресу /api/..."
-    )
-
-    print(
-        "💬 WebSocket включён"
     )
 
     socketio.run(
         app,
         host="0.0.0.0",
-        port=port,
-        debug=False
+        port=port
     )
