@@ -683,7 +683,7 @@ def create_chat():
 
 
 # =========================================================
-# MESSAGES — ИСПРАВЛЕНО! (ПОДДЕРЖИВАЕТ ОБА ФОРМАТА)
+# MESSAGES (ИСПРАВЛЕНО — ПОДДЕРЖИВАЕТ ОБА ФОРМАТА)
 # =========================================================
 
 @app.route("/api/messages", methods=["GET"])
@@ -768,7 +768,7 @@ def send_message():
     if not content:
         return jsonify({"success": False, "message": "Введите сообщение"}), 400
 
-    if receiver_id == user[0]:
+    if int(receiver_id) == user[0]:
         return jsonify({"success": False, "message": "Нельзя отправить сообщение самому себе"}), 400
 
     receiver = get_user_by_id(receiver_id)
