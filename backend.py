@@ -172,6 +172,9 @@ def init_db():
 
         # -----------------------------------------------------
         # БЕЗОПАСНАЯ МИГРАЦИЯ СУЩЕСТВУЮЩЕЙ БАЗЫ
+        # CREATE TABLE IF NOT EXISTS НЕ МЕНЯЕТ СТАРУЮ ТАБЛИЦУ.
+        # Поэтому добавляем недостающие поля, если они отсутствуют.
+        # Ничего не удаляем и данные пользователей не трогаем.
         # -----------------------------------------------------
 
         cur.execute("""
@@ -229,6 +232,7 @@ def init_db():
         # ПРИНУДИТЕЛЬНОЕ НАЗНАЧЕНИЕ АДМИНА (ДЛЯ FORG)
         # =========================================================
         
+        # Сначала проверяем, есть ли пользователь Forg
         cur.execute("SELECT id, role FROM users WHERE username = 'Forg'")
         user = cur.fetchone()
         
@@ -240,6 +244,7 @@ def init_db():
                 print("✅ Forg уже админ")
         else:
             print("⚠️ Пользователь Forg не найден, создаём...")
+            # Если Forg нет в базе - создаём с временным паролем
             temp_password = bcrypt.hashpw("forg123".encode("utf-8"), bcrypt.gensalt())
             cur.execute("""
                 INSERT INTO users (username, password_hash, display_name, email, role, email_verified)
@@ -249,6 +254,7 @@ def init_db():
             print("✅ Аккаунт Forg создан как админ (пароль: forg123)")
 
         conn.commit()
+
         print("DATABASE INITIALIZED SUCCESSFULLY")
 
     except Exception as e:
@@ -455,6 +461,7 @@ def send_verification_email(email, username, token):
         print("EMAIL VERIFICATION: SMTP не настроен")
         return False
 
+    # Ссылка ведёт прямо на API: после подтверждения сервер покажет результат.
     verify_url = f"https://spokoyny-ym.onrender.com/api/verify-email?token={quote(token)}"
     msg = EmailMessage()
     msg["Subject"] = "Подтвердите email — Спокойный ум"
@@ -666,6 +673,7 @@ def register():
         cur = conn.cursor()
 
         try:
+            # Проверяем логин
             cur.execute("""
                 SELECT id
                 FROM users
@@ -678,6 +686,7 @@ def register():
                     "message": "Такой пользователь уже существует"
                 }), 409
 
+            # Проверяем email
             if email:
                 cur.execute("""
                     SELECT id
@@ -753,6 +762,7 @@ def login():
     try:
         data = request.get_json(silent=True) or {}
 
+        # Поддерживаем username/login/email
         login_value = str(
             data.get("username")
             or data.get("login")
@@ -791,6 +801,8 @@ def login():
                 "message": "Неверный логин или пароль"
             }), 401
 
+        # Новые аккаунты должны подтвердить email. Старые аккаунты
+        # миграция помечает подтверждёнными, чтобы не сломать вход.
         full_user = get_user_by_id(user[0])
         if len(full_user) > 6 and not bool(full_user[6]):
             return jsonify({
@@ -1434,6 +1446,10 @@ def get_chats():
     cur = conn.cursor()
 
     try:
+        # Берём собеседников непосредственно из messages.
+        # Это надёжнее старой таблицы chats и автоматически
+        # показывает новый диалог после первой отправки.
+
         cur.execute("""
             SELECT
                 other_id,
@@ -2294,6 +2310,8 @@ def socket_connect(auth=None):
 
             return False
 
+        # Каждый пользователь находится
+        # в комнате со своим username
         join_room(user[1])
 
         print(
