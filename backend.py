@@ -172,9 +172,6 @@ def init_db():
 
         # -----------------------------------------------------
         # БЕЗОПАСНАЯ МИГРАЦИЯ СУЩЕСТВУЮЩЕЙ БАЗЫ
-        # CREATE TABLE IF NOT EXISTS НЕ МЕНЯЕТ СТАРУЮ ТАБЛИЦУ.
-        # Поэтому добавляем недостающие поля, если они отсутствуют.
-        # Ничего не удаляем и данные пользователей не трогаем.
         # -----------------------------------------------------
 
         cur.execute("""
@@ -232,7 +229,6 @@ def init_db():
         # ПРИНУДИТЕЛЬНОЕ НАЗНАЧЕНИЕ АДМИНА (ДЛЯ FORG)
         # =========================================================
         
-        # Сначала проверяем, есть ли пользователь Forg
         cur.execute("SELECT id, role FROM users WHERE username = 'Forg'")
         user = cur.fetchone()
         
@@ -244,7 +240,6 @@ def init_db():
                 print("✅ Forg уже админ")
         else:
             print("⚠️ Пользователь Forg не найден, создаём...")
-            # Если Forg нет в базе - создаём с временным паролем
             temp_password = bcrypt.hashpw("forg123".encode("utf-8"), bcrypt.gensalt())
             cur.execute("""
                 INSERT INTO users (username, password_hash, display_name, email, role, email_verified)
@@ -460,7 +455,6 @@ def send_verification_email(email, username, token):
         print("EMAIL VERIFICATION: SMTP не настроен")
         return False
 
-    # Ссылка ведёт прямо на API: после подтверждения сервер покажет результат.
     verify_url = f"https://spokoyny-ym.onrender.com/api/verify-email?token={quote(token)}"
     msg = EmailMessage()
     msg["Subject"] = "Подтвердите email — Спокойный ум"
@@ -672,7 +666,6 @@ def register():
         cur = conn.cursor()
 
         try:
-            # Проверяем логин
             cur.execute("""
                 SELECT id
                 FROM users
@@ -685,7 +678,6 @@ def register():
                     "message": "Такой пользователь уже существует"
                 }), 409
 
-            # Проверяем email
             if email:
                 cur.execute("""
                     SELECT id
@@ -761,7 +753,6 @@ def login():
     try:
         data = request.get_json(silent=True) or {}
 
-        # Поддерживаем username/login/email
         login_value = str(
             data.get("username")
             or data.get("login")
@@ -800,8 +791,6 @@ def login():
                 "message": "Неверный логин или пароль"
             }), 401
 
-        # Новые аккаунты должны подтвердить email. Старые аккаунты
-        # миграция помечает подтверждёнными, чтобы не сломать вход.
         full_user = get_user_by_id(user[0])
         if len(full_user) > 6 and not bool(full_user[6]):
             return jsonify({
@@ -1445,10 +1434,6 @@ def get_chats():
     cur = conn.cursor()
 
     try:
-        # Берём собеседников непосредственно из messages.
-        # Это надёжнее старой таблицы chats и автоматически
-        # показывает новый диалог после первой отправки.
-
         cur.execute("""
             SELECT
                 other_id,
@@ -1795,38 +1780,33 @@ def get_messages():
 
 
 # =========================================================
-# SEND MESSAGE
+# SEND MESSAGE (ИСПРАВЛЕННАЯ ВЕРСИЯ)
 # =========================================================
 
 @app.route("/api/messages", methods=["POST"])
 def send_message():
-    """
-    Отправка сообщения.
-
-    Важный момент:
-    старая PostgreSQL-схема могла содержать chat_id в messages.
-    Поэтому перед INSERT мы создаём/находим чат и проверяем,
-    существует ли колонка chat_id. Это позволяет работать и со
-    старой, и с новой схемой базы без удаления данных.
-    """
-
     user = get_user_by_token()
-
     if not user:
         return unauthorized()
 
-    data = request.form.to_dict() if request.form else (request.get_json(silent=True) or {})
+    # Определяем, пришли данные как JSON или FormData
+    if request.content_type and 'multipart/form-data' in request.content_type:
+        data = request.form.to_dict()
+        file = request.files.get("image")
+    else:
+        data = request.get_json(silent=True) or {}
+        file = None
 
     try:
-        try:
-            image_url = image_to_data_url(request.files.get("image")) if request.files.get("image") else None
-        except ValueError as image_error:
-            return jsonify({"success": False, "message": str(image_error)}), 400
+        # Обработка фото
+        image_url = None
+        if file:
+            try:
+                image_url = image_to_data_url(file)
+            except ValueError as e:
+                return jsonify({"success": False, "message": str(e)}), 400
 
-        # =================================================
-        # ПОЛУЧАТЕЛЬ
-        # =================================================
-
+        # Получатель
         receiver_id = (
             data.get("receiver_id")
             or data.get("receiverId")
@@ -1844,71 +1824,39 @@ def send_message():
 
         if not receiver_id and to_user:
             target = get_user_by_username(str(to_user).strip())
-
             if not target:
-                return jsonify({
-                    "success": False,
-                    "message": "Получатель не найден"
-                }), 404
-
+                return jsonify({"success": False, "message": "Получатель не найден"}), 404
             receiver_id = target[0]
 
         if receiver_id is None or str(receiver_id).strip() == "":
-            return jsonify({
-                "success": False,
-                "message": "Не указан получатель"
-            }), 400
+            return jsonify({"success": False, "message": "Не указан получатель"}), 400
 
         try:
             receiver_id = int(receiver_id)
         except (ValueError, TypeError):
-            return jsonify({
-                "success": False,
-                "message": "Неверный ID получателя"
-            }), 400
+            return jsonify({"success": False, "message": "Неверный ID получателя"}), 400
 
-        # =================================================
-        # ТЕКСТ
-        # =================================================
-
+        # Текст
         content = (
             data.get("content")
             or data.get("text")
             or data.get("message")
             or ""
         )
-
         content = str(content).strip()
 
         if not content and not image_url:
-            return jsonify({
-                "success": False,
-                "message": "Введите сообщение или выберите фото"
-            }), 400
+            return jsonify({"success": False, "message": "Введите сообщение или выберите фото"}), 400
 
         if len(content) > 5000:
-            return jsonify({
-                "success": False,
-                "message": "Сообщение слишком длинное"
-            }), 400
+            return jsonify({"success": False, "message": "Сообщение слишком длинное"}), 400
 
         if receiver_id == user[0]:
-            return jsonify({
-                "success": False,
-                "message": "Нельзя отправить сообщение самому себе"
-            }), 400
-
-        # =================================================
-        # ПРОВЕРКА ПОЛУЧАТЕЛЯ
-        # =================================================
+            return jsonify({"success": False, "message": "Нельзя отправить сообщение самому себе"}), 400
 
         receiver = get_user_by_id(receiver_id)
-
         if not receiver:
-            return jsonify({
-                "success": False,
-                "message": "Получатель не найден"
-            }), 404
+            return jsonify({"success": False, "message": "Получатель не найден"}), 404
 
         # =================================================
         # DATABASE
@@ -1918,110 +1866,46 @@ def send_message():
         cur = conn.cursor()
 
         try:
-            # -------------------------------------------------
-            # 1. Находим или создаём чат ПЕРЕД сообщением.
-            # -------------------------------------------------
-
             chat_id = None
-
             try:
                 cur.execute("""
-                    SELECT id
-                    FROM chats
-                    WHERE
-                        (
-                            user1_id = %s
-                            AND user2_id = %s
-                        )
-                        OR
-                        (
-                            user1_id = %s
-                            AND user2_id = %s
-                        )
+                    SELECT id FROM chats
+                    WHERE (user1_id = %s AND user2_id = %s) OR (user1_id = %s AND user2_id = %s)
                     LIMIT 1
-                """, (
-                    user[0],
-                    receiver_id,
-                    receiver_id,
-                    user[0]
-                ))
-
+                """, (user[0], receiver_id, receiver_id, user[0]))
                 chat = cur.fetchone()
-
                 if chat:
                     chat_id = chat[0]
                 else:
-                    cur.execute("""
-                        INSERT INTO chats (
-                            user1_id,
-                            user2_id
-                        )
-                        VALUES (%s, %s)
-                        RETURNING id
-                    """, (
-                        user[0],
-                        receiver_id
-                    ))
-
+                    cur.execute("INSERT INTO chats (user1_id, user2_id) VALUES (%s, %s) RETURNING id", (user[0], receiver_id))
                     chat_row = cur.fetchone()
-
                     if chat_row:
                         chat_id = chat_row[0]
-
             except Exception as chat_error:
-                # Если старая таблица chats отличается от новой,
-                # не ломаем отправку сообщения.
-                print("CHAT CREATE ERROR:")
-                print(repr(chat_error))
+                print("CHAT CREATE ERROR:", repr(chat_error))
                 traceback.print_exc()
                 conn.rollback()
-
-                # Начинаем транзакцию заново.
                 cur.close()
                 conn.close()
-
                 conn = get_db()
                 cur = conn.cursor()
-
                 chat_id = None
 
-            # -------------------------------------------------
-            # 2. Проверяем структуру messages.
-            # -------------------------------------------------
-
             columns = table_columns(cur, "messages")
-
             required = {"sender_id", "receiver_id", "content"}
-
             missing = required - columns
-
             if missing:
-                raise RuntimeError(
-                    "В таблице messages отсутствуют колонки: "
-                    + ", ".join(sorted(missing))
-                )
-
-            # -------------------------------------------------
-            # 3. INSERT.
-            #
-            # В базе может остаться старая схема messages с
-            # обязательными колонками from_user / to_user.
-            # Поэтому добавляем их автоматически, если они есть.
-            # -------------------------------------------------
+                raise RuntimeError("В таблице messages отсутствуют колонки: " + ", ".join(sorted(missing)))
 
             insert_columns = ["sender_id", "receiver_id", "content", "image_url"]
             insert_values = [user[0], receiver_id, content, image_url]
 
-            # Старые версии базы могли требовать from_user/to_user.
-            # Передаём туда ID пользователей.
             if "from_user" in columns:
                 insert_columns.append("from_user")
                 insert_values.append(user[0])
-
             if "to_user" in columns:
                 insert_columns.append("to_user")
                 insert_values.append(receiver_id)
-
             if "chat_id" in columns and chat_id is not None:
                 insert_columns.append("chat_id")
                 insert_values.append(chat_id)
@@ -2029,111 +1913,49 @@ def send_message():
             placeholders = ", ".join(["%s"] * len(insert_values))
             column_sql = ", ".join(insert_columns)
 
-            cur.execute(
-                f"""
-                    INSERT INTO messages ({column_sql})
-                    VALUES ({placeholders})
-                    RETURNING id, created_at
-                """,
-                tuple(insert_values)
-            )
-
+            cur.execute(f"INSERT INTO messages ({column_sql}) VALUES ({placeholders}) RETURNING id, created_at", tuple(insert_values))
             row = cur.fetchone()
-
             if not row:
-                raise RuntimeError(
-                    "Не удалось создать сообщение"
-                )
-
+                raise RuntimeError("Не удалось создать сообщение")
             message_id = row[0]
             created_at = row[1]
-
             conn.commit()
 
         except Exception as e:
             conn.rollback()
-
-            print("")
-            print("===================================")
-            print("SEND MESSAGE DATABASE ERROR")
-            print("TYPE:", type(e).__name__)
-            print("ERROR:", str(e))
-            print("REPR:", repr(e))
-            print("===================================")
+            print("SEND MESSAGE DATABASE ERROR:", repr(e))
             traceback.print_exc()
-
             raise
-
         finally:
             cur.close()
             conn.close()
 
-        # =================================================
-        # ОБЪЕКТ СООБЩЕНИЯ
-        # =================================================
-
         message = {
             "id": message_id,
             "chat_id": chat_id,
-
             "sender_id": user[0],
             "sender_username": user[1],
             "sender_display_name": user[2] or user[1],
-
             "receiver_id": receiver[0],
             "receiver_username": receiver[1],
             "receiver_display_name": receiver[2] or receiver[1],
-
             "content": content,
             "image_url": image_url or "",
-
-            "created_at": (
-                created_at.isoformat()
-                if created_at
-                else None
-            )
+            "created_at": created_at.isoformat() if created_at else None
         }
 
-        # =================================================
-        # SOCKET.IO
-        # =================================================
-
         try:
-            socketio.emit(
-                "new_message",
-                message,
-                room=receiver[1]
-            )
-
-            socketio.emit(
-                "message_sent",
-                message,
-                room=user[1]
-            )
-
+            socketio.emit("new_message", message, room=receiver[1])
+            socketio.emit("message_sent", message, room=user[1])
         except Exception as e:
             print("SOCKET MESSAGE ERROR:", repr(e))
 
-        return jsonify({
-            "success": True,
-            "message": message
-        }), 200
+        return jsonify({"success": True, "message": message}), 200
 
     except Exception as e:
-        print("")
-        print("===================================")
-        print("SEND MESSAGE FATAL ERROR")
-        print("TYPE:", type(e).__name__)
-        print("ERROR:", str(e))
-        print("REPR:", repr(e))
-        print("===================================")
+        print("SEND MESSAGE FATAL ERROR:", repr(e))
         traceback.print_exc()
-
-        return jsonify({
-            "success": False,
-            "message": "Ошибка отправки сообщения",
-            "error": str(e)
-        }), 500
+        return jsonify({"success": False, "message": "Ошибка отправки сообщения", "error": str(e)}), 500
 
 
 # =========================================================
@@ -2472,8 +2294,6 @@ def socket_connect(auth=None):
 
             return False
 
-        # Каждый пользователь находится
-        # в комнате со своим username
         join_room(user[1])
 
         print(
