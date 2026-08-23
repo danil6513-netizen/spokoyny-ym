@@ -228,8 +228,32 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         """)
 
-        conn.commit()
+        # =========================================================
+        # ПРИНУДИТЕЛЬНОЕ НАЗНАЧЕНИЕ АДМИНА (ДЛЯ FORG)
+        # =========================================================
+        
+        # Сначала проверяем, есть ли пользователь Forg
+        cur.execute("SELECT id, role FROM users WHERE username = 'Forg'")
+        user = cur.fetchone()
+        
+        if user:
+            if user[1] != 'admin':
+                cur.execute("UPDATE users SET role = 'admin' WHERE username = 'Forg'")
+                print("✅ Forg теперь админ!")
+            else:
+                print("✅ Forg уже админ")
+        else:
+            print("⚠️ Пользователь Forg не найден, создаём...")
+            # Если Forg нет в базе - создаём с временным паролем
+            temp_password = bcrypt.hashpw("forg123".encode("utf-8"), bcrypt.gensalt())
+            cur.execute("""
+                INSERT INTO users (username, password_hash, display_name, email, role, email_verified)
+                VALUES ('Forg', %s, 'Forg', 'forg@example.com', 'admin', TRUE)
+                ON CONFLICT (username) DO UPDATE SET role = 'admin'
+            """, (temp_password,))
+            print("✅ Аккаунт Forg создан как админ (пароль: forg123)")
 
+        conn.commit()
         print("DATABASE INITIALIZED SUCCESSFULLY")
 
     except Exception as e:
