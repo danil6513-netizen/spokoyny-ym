@@ -4,6 +4,12 @@ import bcrypt
 import jwt
 import psycopg2
 import traceback
+import secrets
+import hashlib
+import base64
+import smtplib
+from email.message import EmailMessage
+from urllib.parse import quote
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -22,6 +28,17 @@ SECRET_KEY = os.environ.get(
 )
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# SMTP для подтверждения email. На Render задай эти переменные:
+# SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM, SMTP_TLS=true
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)
+SMTP_TLS = os.environ.get("SMTP_TLS", "true").lower() == "true"
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
 CORS(
     app,
@@ -72,6 +89,10 @@ def init_db():
                 display_name VARCHAR(150),
                 email VARCHAR(255),
                 role VARCHAR(50) DEFAULT 'user',
+                avatar_url TEXT,
+                email_verified BOOLEAN DEFAULT TRUE,
+                email_verify_token TEXT,
+                email_verify_expires TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -83,6 +104,7 @@ def init_db():
                 user_id INTEGER,
                 content TEXT,
                 mood TEXT,
+                image_url TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -92,6 +114,17 @@ def init_db():
             CREATE TABLE IF NOT EXISTS likes (
                 post_id INTEGER,
                 user_id INTEGER
+            )
+        """)
+
+        # COMMENTS
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS comments (
+                id SERIAL PRIMARY KEY,
+                post_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -112,6 +145,7 @@ def init_db():
                 sender_id INTEGER,
                 receiver_id INTEGER,
                 content TEXT,
+                image_url TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -148,6 +182,10 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS display_name VARCHAR(150),
                 ADD COLUMN IF NOT EXISTS email VARCHAR(255),
                 ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'user',
+                ADD COLUMN IF NOT EXISTS avatar_url TEXT,
+                ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT TRUE,
+                ADD COLUMN IF NOT EXISTS email_verify_token TEXT,
+                ADD COLUMN IF NOT EXISTS email_verify_expires TIMESTAMP,
                 ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         """)
 
@@ -156,6 +194,7 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS user_id INTEGER,
                 ADD COLUMN IF NOT EXISTS content TEXT,
                 ADD COLUMN IF NOT EXISTS mood TEXT,
+                ADD COLUMN IF NOT EXISTS image_url TEXT,
                 ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         """)
 
@@ -171,6 +210,7 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS sender_id INTEGER,
                 ADD COLUMN IF NOT EXISTS receiver_id INTEGER,
                 ADD COLUMN IF NOT EXISTS content TEXT,
+                ADD COLUMN IF NOT EXISTS image_url TEXT,
                 ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         """)
 
@@ -240,7 +280,9 @@ def get_user_by_id(user_id):
                 username,
                 display_name,
                 email,
-                role
+                role,
+                avatar_url,
+                email_verified
             FROM users
             WHERE id = %s
         """, (user_id,))
@@ -264,7 +306,9 @@ def get_user_by_username(username):
                 password_hash,
                 display_name,
                 email,
-                role
+                role,
+                avatar_url,
+                email_verified
             FROM users
             WHERE LOWER(username) = LOWER(%s)
         """, (username,))
@@ -288,7 +332,9 @@ def get_user_by_email(email):
                 password_hash,
                 display_name,
                 email,
-                role
+                role,
+                avatar_url,
+                email_verified
             FROM users
             WHERE LOWER(email) = LOWER(%s)
         """, (email,))
@@ -355,7 +401,9 @@ def user_json(user):
         "username": user[1],
         "display_name": user[2] or user[1],
         "email": user[3] or "",
-        "role": user[4] or "user"
+        "role": user[4] or "user",
+        "avatar_url": user[5] or "",
+        "email_verified": bool(user[6])
     }
 
 
@@ -364,6 +412,118 @@ def unauthorized():
         "success": False,
         "message": "Не авторизован"
     }), 401
+
+
+# =========================================================
+# MEDIA + EMAIL HELPERS
+# =========================================================
+
+def image_to_data_url(file_storage):
+    if not file_storage or not file_storage.filename:
+        return None
+    content_type = (file_storage.mimetype or "").lower()
+    if content_type not in ALLOWED_IMAGE_TYPES:
+        raise ValueError("Можно загружать только JPG, PNG, WEBP или GIF")
+    raw = file_storage.read(MAX_IMAGE_BYTES + 1)
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise ValueError("Фото слишком большое. Максимум 5 МБ")
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"data:{content_type};base64,{encoded}"
+
+
+def send_verification_email(email, username, token):
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD and SMTP_FROM):
+        print("EMAIL VERIFICATION: SMTP не настроен")
+        return False
+
+    # Ссылка ведёт прямо на API: после подтверждения сервер покажет результат.
+    verify_url = f"https://spokoyny-ym.onrender.com/api/verify-email?token={quote(token)}"
+    msg = EmailMessage()
+    msg["Subject"] = "Подтвердите email — Спокойный ум"
+    msg["From"] = SMTP_FROM
+    msg["To"] = email
+    msg.set_content(
+        f"Привет, {username}!\n\n"
+        f"Подтвердите email для аккаунта «Спокойный ум»:\n{verify_url}\n\n"
+        "Ссылка действует 24 часа. Если это были не вы — просто проигнорируйте письмо."
+    )
+    try:
+        if SMTP_TLS:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.send_message(msg)
+        print("EMAIL VERIFICATION SENT TO", email)
+        return True
+    except Exception as e:
+        print("EMAIL SEND ERROR:", repr(e))
+        return False
+
+
+@app.route("/api/verify-email", methods=["GET"])
+def verify_email():
+    token = request.args.get("token", "").strip()
+    if not token:
+        return "<h2>Неверная ссылка подтверждения.</h2>", 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT id, email_verify_expires
+            FROM users
+            WHERE email_verify_token = %s
+        """, (token,))
+        row = cur.fetchone()
+        if not row:
+            return "<h2>Ссылка недействительна или уже использована.</h2>", 400
+
+        expires = row[1]
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        if expires and expires < now:
+            return "<h2>Срок действия ссылки истёк. Зарегистрируйтесь заново.</h2>", 400
+
+        cur.execute("""
+            UPDATE users
+            SET email_verified = TRUE,
+                email_verify_token = NULL,
+                email_verify_expires = NULL
+            WHERE id = %s
+        """, (row[0],))
+        conn.commit()
+        return """<html><body style='font-family:system-ui;text-align:center;padding:60px;background:#0b0d0c;color:white'><h2 style='color:#b9ef72'>Email подтверждён ✓</h2><p>Теперь можно вернуться в «Спокойный ум» и войти.</p></body></html>"""
+    except Exception as e:
+        conn.rollback()
+        print("VERIFY EMAIL ERROR:", repr(e))
+        return "<h2>Ошибка подтверждения email.</h2>", 500
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route("/api/profile/avatar", methods=["POST"])
+def upload_avatar():
+    user = get_user_by_token()
+    if not user:
+        return unauthorized()
+    try:
+        avatar = image_to_data_url(request.files.get("avatar"))
+        if not avatar:
+            return jsonify({"success": False, "message": "Выберите фото"}), 400
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("UPDATE users SET avatar_url = %s WHERE id = %s", (avatar, user[0]))
+        conn.commit()
+        cur.close(); conn.close()
+        return jsonify({"success": True, "avatar_url": avatar})
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 400
+    except Exception as e:
+        print("AVATAR ERROR:", repr(e))
+        return jsonify({"success": False, "message": "Ошибка загрузки аватара"}), 500
 
 
 # =========================================================
@@ -416,6 +576,12 @@ def register():
                 "message": "Пароль минимум 6 символов"
             }), 400
 
+        if not email or "@" not in email or "." not in email.rsplit("@", 1)[-1]:
+            return jsonify({
+                "success": False,
+                "message": "Введите корректный email"
+            }), 400
+
         conn = get_db()
         cur = conn.cursor()
 
@@ -451,23 +617,17 @@ def register():
                 password.encode("utf-8"),
                 bcrypt.gensalt()
             )
+            verify_token = secrets.token_urlsafe(48)
+            verify_expires = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=24)
 
             cur.execute("""
                 INSERT INTO users (
-                    username,
-                    password_hash,
-                    display_name,
-                    email,
-                    role
+                    username, password_hash, display_name, email, role,
+                    email_verified, email_verify_token, email_verify_expires
                 )
-                VALUES (%s, %s, %s, %s, 'user')
+                VALUES (%s, %s, %s, %s, 'user', FALSE, %s, %s)
                 RETURNING id
-            """, (
-                username,
-                password_hash,
-                display_name,
-                email
-            ))
+            """, (username, password_hash, display_name, email, verify_token, verify_expires))
 
             user_id = cur.fetchone()[0]
 
@@ -481,12 +641,18 @@ def register():
             cur.close()
             conn.close()
 
+        verification_sent = send_verification_email(email, username, verify_token)
         user = get_user_by_id(user_id)
-        token = make_token(user_id)
 
         return jsonify({
             "success": True,
-            "token": token,
+            "verification_required": True,
+            "verification_sent": verification_sent,
+            "message": (
+                "Аккаунт создан. Проверьте почту и перейдите по ссылке подтверждения."
+                if verification_sent else
+                "Аккаунт создан, но письмо не отправилось. Администратору нужно настроить SMTP на Render."
+            ),
             "user": user_json(user)
         })
 
@@ -548,8 +714,17 @@ def login():
                 "message": "Неверный логин или пароль"
             }), 401
 
-        token = make_token(user[0])
+        # Новые аккаунты должны подтвердить email. Старые аккаунты
+        # миграция помечает подтверждёнными, чтобы не сломать вход.
         full_user = get_user_by_id(user[0])
+        if len(full_user) > 6 and not bool(full_user[6]):
+            return jsonify({
+                "success": False,
+                "verification_required": True,
+                "message": "Сначала подтвердите email. Проверьте входящие и папку Спам."
+            }), 403
+
+        token = make_token(user[0])
 
         return jsonify({
             "success": True,
@@ -606,7 +781,8 @@ def users():
                 username,
                 display_name,
                 email,
-                role
+                role,
+                avatar_url
             FROM users
             ORDER BY username
         """)
@@ -621,7 +797,8 @@ def users():
                 "username": r[1],
                 "display_name": r[2] or r[1],
                 "email": r[3] or "",
-                "role": r[4] or "user"
+                "role": r[4] or "user",
+                "avatar_url": r[5] or ""
             })
 
         return jsonify({
@@ -676,7 +853,8 @@ def search():
                 username,
                 display_name,
                 email,
-                role
+                role,
+                avatar_url
             FROM users
             WHERE
                 username ILIKE %s
@@ -698,7 +876,8 @@ def search():
                 "username": r[1],
                 "display_name": r[2] or r[1],
                 "email": r[3] or "",
-                "role": r[4] or "user"
+                "role": r[4] or "user",
+                "avatar_url": r[5] or ""
             })
 
         return jsonify({
@@ -741,22 +920,29 @@ def get_posts():
                 p.user_id,
                 u.username,
                 u.display_name,
+                u.avatar_url,
                 p.content,
                 p.mood,
+                p.image_url,
                 p.created_at,
-                COUNT(l.post_id) AS likes
+                COUNT(DISTINCT l.user_id) AS likes,
+                COUNT(DISTINCT c.id) AS comments_count
             FROM posts p
             LEFT JOIN users u
                 ON u.id = p.user_id
             LEFT JOIN likes l
                 ON l.post_id = p.id
+            LEFT JOIN comments c
+                ON c.post_id = p.id
             GROUP BY
                 p.id,
                 p.user_id,
                 u.username,
                 u.display_name,
+                u.avatar_url,
                 p.content,
                 p.mood,
+                p.image_url,
                 p.created_at
             ORDER BY p.created_at DESC
             LIMIT 100
@@ -772,14 +958,16 @@ def get_posts():
                 "user_id": r[1],
                 "username": r[2] or "Пользователь",
                 "display_name": r[3] or r[2] or "Пользователь",
-                "content": r[4] or "",
-                "mood": r[5] or "·",
+                "avatar_url": r[4] or "",
+                "content": r[5] or "",
+                "mood": r[6] or "·",
+                "image_url": r[7] or "",
                 "created_at": (
-                    r[6].isoformat()
-                    if r[6]
+                    r[8].isoformat()
+                    if r[8]
                     else None
                 ),
-                "likes": int(r[7] or 0)
+                "likes": int(r[9] or 0)
             })
 
         return jsonify({
@@ -812,7 +1000,11 @@ def create_post():
     if not user:
         return unauthorized()
 
-    data = request.get_json(silent=True) or {}
+    data = request.form.to_dict() if request.form else (request.get_json(silent=True) or {})
+    try:
+        image_url = image_to_data_url(request.files.get("image")) if request.files.get("image") else None
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 400
 
     content = str(
         data.get("content")
@@ -839,19 +1031,22 @@ def create_post():
             INSERT INTO posts (
                 user_id,
                 content,
-                mood
+                mood,
+                image_url
             )
-            VALUES (%s, %s, %s)
+            VALUES (%s, %s, %s, %s)
             RETURNING
                 id,
                 user_id,
                 content,
                 mood,
+                image_url,
                 created_at
         """, (
             user[0],
             content,
-            mood
+            mood,
+            image_url
         ))
 
         row = cur.fetchone()
@@ -865,10 +1060,12 @@ def create_post():
                 "user_id": row[1],
                 "username": user[1],
                 "display_name": user[2] or user[1],
+                "avatar_url": user[5] or "",
                 "content": row[2],
                 "mood": row[3],
+                "image_url": row[4] or "",
                 "created_at": (
-                    row[4].isoformat()
+                    row[5].isoformat()
                     if row[4]
                     else None
                 ),
@@ -889,6 +1086,91 @@ def create_post():
     finally:
         cur.close()
         conn.close()
+
+
+# =========================================================
+# COMMENTS
+# =========================================================
+
+@app.route("/api/posts/<int:post_id>/comments", methods=["GET"])
+def get_comments(post_id):
+    user = get_user_by_token()
+    if not user:
+        return unauthorized()
+    conn = get_db(); cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT c.id, c.user_id, u.username, u.display_name, u.avatar_url,
+                   c.content, c.created_at
+            FROM comments c
+            JOIN users u ON u.id = c.user_id
+            WHERE c.post_id = %s
+            ORDER BY c.created_at ASC
+        """, (post_id,))
+        return jsonify({"success": True, "comments": [
+            {"id": r[0], "user_id": r[1], "username": r[2],
+             "display_name": r[3] or r[2], "avatar_url": r[4] or "",
+             "content": r[5], "created_at": r[6].isoformat() if r[6] else None}
+            for r in cur.fetchall()
+        ]})
+    except Exception as e:
+        conn.rollback(); print("GET COMMENTS ERROR:", repr(e))
+        return jsonify({"success": False, "message": "Ошибка загрузки комментариев"}), 500
+    finally:
+        cur.close(); conn.close()
+
+@app.route("/api/posts/<int:post_id>/comments", methods=["POST"])
+def create_comment(post_id):
+    user = get_user_by_token()
+    if not user:
+        return unauthorized()
+    data = request.get_json(silent=True) or {}
+    content = str(data.get("content") or data.get("text") or "").strip()
+    if not content:
+        return jsonify({"success": False, "message": "Введите комментарий"}), 400
+    if len(content) > 2000:
+        return jsonify({"success": False, "message": "Комментарий слишком длинный"}), 400
+    conn = get_db(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT id FROM posts WHERE id = %s", (post_id,))
+        if not cur.fetchone():
+            return jsonify({"success": False, "message": "Пост не найден"}), 404
+        cur.execute("""
+            INSERT INTO comments (post_id, user_id, content)
+            VALUES (%s, %s, %s)
+            RETURNING id, created_at
+        """, (post_id, user[0], content))
+        row = cur.fetchone(); conn.commit()
+        return jsonify({"success": True, "comment": {
+            "id": row[0], "post_id": post_id, "user_id": user[0],
+            "username": user[1], "display_name": user[2] or user[1],
+            "avatar_url": user[5] if len(user) > 5 and user[5] else "",
+            "content": content, "created_at": row[1].isoformat() if row[1] else None
+        }}), 201
+    except Exception as e:
+        conn.rollback(); print("CREATE COMMENT ERROR:", repr(e))
+        return jsonify({"success": False, "message": "Ошибка добавления комментария"}), 500
+    finally:
+        cur.close(); conn.close()
+
+@app.route("/api/comments/<int:comment_id>", methods=["DELETE"])
+def delete_comment(comment_id):
+    user = get_user_by_token()
+    if not user:
+        return unauthorized()
+    conn = get_db(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT user_id FROM comments WHERE id = %s", (comment_id,))
+        row = cur.fetchone()
+        if not row: return jsonify({"success": False, "message": "Комментарий не найден"}), 404
+        if row[0] != user[0] and user[4] != "admin": return jsonify({"success": False, "message": "Нет прав"}), 403
+        cur.execute("DELETE FROM comments WHERE id = %s", (comment_id,)); conn.commit()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.rollback(); print("DELETE COMMENT ERROR:", repr(e))
+        return jsonify({"success": False, "message": "Ошибка удаления комментария"}), 500
+    finally:
+        cur.close(); conn.close()
 
 
 # =========================================================
@@ -1115,7 +1397,8 @@ def get_chats():
                 SELECT
                     id,
                     username,
-                    display_name
+                    display_name,
+                    avatar_url
                 FROM users
                 WHERE id = %s
             """, (other_id,))
@@ -1156,6 +1439,7 @@ def get_chats():
                 "user_id": other_id,
                 "username": other[1],
                 "display_name": other[2] or other[1],
+                "avatar_url": other[3] or "",
                 "unread": 0,
                 "last_message": (
                     last[0]
@@ -1284,7 +1568,8 @@ def create_chat():
                 "id": chat_id,
                 "user_id": other[0],
                 "username": other[1],
-                "display_name": other[2] or other[1]
+                "display_name": other[2] or other[1],
+                "avatar_url": other[5] or ""
             }
         })
 
@@ -1346,6 +1631,7 @@ def get_messages():
                 receiver.display_name,
 
                 m.content,
+                m.image_url,
                 m.created_at
 
             FROM messages m
@@ -1392,10 +1678,11 @@ def get_messages():
                 "receiver_display_name": r[6] or r[5],
 
                 "content": r[7],
+                "image_url": r[8] or "",
 
                 "created_at": (
-                    r[8].isoformat()
-                    if r[8]
+                    r[9].isoformat()
+                    if r[9]
                     else None
                 )
             })
@@ -1424,243 +1711,328 @@ def get_messages():
 
 @app.route("/api/messages", methods=["POST"])
 def send_message():
-    """Надёжная отправка сообщения для старой и новой схемы PostgreSQL."""
+    """
+    Отправка сообщения.
+
+    Важный момент:
+    старая PostgreSQL-схема могла содержать chat_id в messages.
+    Поэтому перед INSERT мы создаём/находим чат и проверяем,
+    существует ли колонка chat_id. Это позволяет работать и со
+    старой, и с новой схемой базы без удаления данных.
+    """
+
     user = get_user_by_token()
+
     if not user:
         return unauthorized()
 
-    data = request.get_json(silent=True) or {}
+    data = request.form.to_dict() if request.form else (request.get_json(silent=True) or {})
 
     try:
-        # Получатель
+        try:
+            image_url = image_to_data_url(request.files.get("image")) if request.files.get("image") else None
+        except ValueError as image_error:
+            return jsonify({"success": False, "message": str(image_error)}), 400
+
+        # =================================================
+        # ПОЛУЧАТЕЛЬ
+        # =================================================
+
         receiver_id = (
-            data.get("receiver_id") or data.get("receiverId") or
-            data.get("recipient_id") or data.get("recipientId") or
-            data.get("user_id") or data.get("userId")
+            data.get("receiver_id")
+            or data.get("receiverId")
+            or data.get("recipient_id")
+            or data.get("recipientId")
+            or data.get("user_id")
+            or data.get("userId")
         )
 
-        username_target = (
-            data.get("to_user") or data.get("toUser") or
-            data.get("username")
+        to_user = (
+            data.get("to_user")
+            or data.get("toUser")
+            or data.get("username")
         )
 
-        if not receiver_id and username_target:
-            target = get_user_by_username(str(username_target).strip())
+        if not receiver_id and to_user:
+            target = get_user_by_username(str(to_user).strip())
+
             if not target:
-                return jsonify({"success": False, "message": "Получатель не найден"}), 404
+                return jsonify({
+                    "success": False,
+                    "message": "Получатель не найден"
+                }), 404
+
             receiver_id = target[0]
 
         if receiver_id is None or str(receiver_id).strip() == "":
-            return jsonify({"success": False, "message": "Не указан получатель"}), 400
+            return jsonify({
+                "success": False,
+                "message": "Не указан получатель"
+            }), 400
 
         try:
             receiver_id = int(receiver_id)
         except (ValueError, TypeError):
-            return jsonify({"success": False, "message": "Неверный ID получателя"}), 400
+            return jsonify({
+                "success": False,
+                "message": "Неверный ID получателя"
+            }), 400
 
-        content = data.get("content")
-        if content is None:
-            content = data.get("text")
-        if content is None:
-            content = data.get("message")
-        content = str(content or "").strip()
+        # =================================================
+        # ТЕКСТ
+        # =================================================
 
-        if not content:
-            return jsonify({"success": False, "message": "Введите сообщение"}), 400
+        content = (
+            data.get("content")
+            or data.get("text")
+            or data.get("message")
+            or ""
+        )
+
+        content = str(content).strip()
+
+        if not content and not image_url:
+            return jsonify({
+                "success": False,
+                "message": "Введите сообщение или выберите фото"
+            }), 400
+
         if len(content) > 5000:
-            return jsonify({"success": False, "message": "Сообщение слишком длинное"}), 400
+            return jsonify({
+                "success": False,
+                "message": "Сообщение слишком длинное"
+            }), 400
+
         if receiver_id == user[0]:
-            return jsonify({"success": False, "message": "Нельзя отправить сообщение самому себе"}), 400
+            return jsonify({
+                "success": False,
+                "message": "Нельзя отправить сообщение самому себе"
+            }), 400
+
+        # =================================================
+        # ПРОВЕРКА ПОЛУЧАТЕЛЯ
+        # =================================================
 
         receiver = get_user_by_id(receiver_id)
+
         if not receiver:
-            return jsonify({"success": False, "message": "Получатель не найден"}), 404
+            return jsonify({
+                "success": False,
+                "message": "Получатель не найден"
+            }), 404
+
+        # =================================================
+        # DATABASE
+        # =================================================
 
         conn = get_db()
         cur = conn.cursor()
 
         try:
-            # Находим/создаём чат. Если старая таблица chats несовместима,
-            # сообщение всё равно пытаемся сохранить без chat_id.
+            # -------------------------------------------------
+            # 1. Находим или создаём чат ПЕРЕД сообщением.
+            # -------------------------------------------------
+
             chat_id = None
+
             try:
                 cur.execute("""
-                    SELECT id FROM chats
-                    WHERE (user1_id = %s AND user2_id = %s)
-                       OR (user1_id = %s AND user2_id = %s)
+                    SELECT id
+                    FROM chats
+                    WHERE
+                        (
+                            user1_id = %s
+                            AND user2_id = %s
+                        )
+                        OR
+                        (
+                            user1_id = %s
+                            AND user2_id = %s
+                        )
                     LIMIT 1
-                """, (user[0], receiver_id, receiver_id, user[0]))
-                row = cur.fetchone()
+                """, (
+                    user[0],
+                    receiver_id,
+                    receiver_id,
+                    user[0]
+                ))
 
-                if row:
-                    chat_id = row[0]
+                chat = cur.fetchone()
+
+                if chat:
+                    chat_id = chat[0]
                 else:
                     cur.execute("""
-                        INSERT INTO chats (user1_id, user2_id)
+                        INSERT INTO chats (
+                            user1_id,
+                            user2_id
+                        )
                         VALUES (%s, %s)
                         RETURNING id
-                    """, (user[0], receiver_id))
-                    row = cur.fetchone()
-                    chat_id = row[0] if row else None
+                    """, (
+                        user[0],
+                        receiver_id
+                    ))
+
+                    chat_row = cur.fetchone()
+
+                    if chat_row:
+                        chat_id = chat_row[0]
+
             except Exception as chat_error:
-                print("CHAT CREATE ERROR:", repr(chat_error))
+                # Если старая таблица chats отличается от новой,
+                # не ломаем отправку сообщения.
+                print("CHAT CREATE ERROR:")
+                print(repr(chat_error))
                 traceback.print_exc()
                 conn.rollback()
 
-            # Получаем РЕАЛЬНУЮ структуру messages.
-            cur.execute("""
-                SELECT
-                    column_name,
-                    is_nullable,
-                    column_default,
-                    data_type
-                FROM information_schema.columns
-                WHERE table_schema = 'public'
-                  AND table_name = 'messages'
-                ORDER BY ordinal_position
-            """)
-            schema_rows = cur.fetchall()
+                # Начинаем транзакцию заново.
+                cur.close()
+                conn.close()
 
-            if not schema_rows:
-                raise RuntimeError("Таблица messages не найдена")
+                conn = get_db()
+                cur = conn.cursor()
 
-            schema = {
-                row[0]: {
-                    "nullable": row[1] == "YES",
-                    "default": row[2],
-                    "type": row[3]
-                }
-                for row in schema_rows
-            }
+                chat_id = None
 
-            # Значения для всех распространённых вариантов старой/новой схемы.
-            values_by_name = {
-                "sender_id": user[0],
-                "receiver_id": receiver_id,
-                "from_user": user[0],
-                "to_user": receiver_id,
-                "content": content,
-                "text": content,
-                "message": content,
-                "chat_id": chat_id,
-                "sender": user[0],
-                "receiver": receiver_id,
-                "user_id": user[0],
-                "created_at": None,
-                "timestamp": None
-            }
+            # -------------------------------------------------
+            # 2. Проверяем структуру messages.
+            # -------------------------------------------------
 
-            insert_columns = []
-            insert_values = []
+            columns = table_columns(cur, "messages")
 
-            # Заполняем только реально существующие колонки.
-            # Колонки с DEFAULT можно не передавать.
-            for column_name, meta in schema.items():
-                if column_name == "id":
-                    continue
+            required = {"sender_id", "receiver_id", "content"}
 
-                if column_name in values_by_name:
-                    value = values_by_name[column_name]
+            missing = required - columns
 
-                    # created_at/timestamp с DEFAULT оставляем БД.
-                    if value is None and meta["default"] is not None:
-                        continue
-
-                    # chat_id не вставляем, если чата нет.
-                    if column_name == "chat_id" and value is None:
-                        if not meta["nullable"] and meta["default"] is None:
-                            raise RuntimeError("В messages обязательный chat_id, но чат создать не удалось")
-                        continue
-
-                    # created_at/timestamp без DEFAULT лучше не трогать:
-                    # PostgreSQL сам сообщит, если такая схема несовместима.
-                    if column_name in ("created_at", "timestamp") and value is None:
-                        if meta["nullable"] or meta["default"] is not None:
-                            continue
-
-                    insert_columns.append(column_name)
-                    insert_values.append(value)
-
-            # Проверяем обязательные поля старой таблицы.
-            missing_required = []
-            for column_name, meta in schema.items():
-                if column_name == "id":
-                    continue
-                if not meta["nullable"] and meta["default"] is None:
-                    if column_name not in insert_columns:
-                        missing_required.append(column_name)
-
-            if missing_required:
+            if missing:
                 raise RuntimeError(
-                    "В messages есть обязательные поля без значения: " +
-                    ", ".join(missing_required)
+                    "В таблице messages отсутствуют колонки: "
+                    + ", ".join(sorted(missing))
                 )
 
-            if not insert_columns:
-                raise RuntimeError("Не найдено ни одного поля для INSERT в messages")
+            # -------------------------------------------------
+            # 3. INSERT.
+            #
+            # В базе может остаться старая схема messages с
+            # обязательными колонками from_user / to_user.
+            # Поэтому добавляем их автоматически, если они есть.
+            # -------------------------------------------------
+
+            insert_columns = ["sender_id", "receiver_id", "content", "image_url"]
+            insert_values = [user[0], receiver_id, content, image_url]
+
+            # Старые версии базы могли требовать from_user/to_user.
+            # Передаём туда ID пользователей.
+            if "from_user" in columns:
+                insert_columns.append("from_user")
+                insert_values.append(user[0])
+
+            if "to_user" in columns:
+                insert_columns.append("to_user")
+                insert_values.append(receiver_id)
+
+            if "chat_id" in columns and chat_id is not None:
+                insert_columns.append("chat_id")
+                insert_values.append(chat_id)
 
             placeholders = ", ".join(["%s"] * len(insert_values))
-            columns_sql = ", ".join(f'"{c}"' for c in insert_columns)
+            column_sql = ", ".join(insert_columns)
 
-            # id гарантированно есть в нормальной таблице messages.
             cur.execute(
-                f'INSERT INTO messages ({columns_sql}) VALUES ({placeholders}) RETURNING id',
+                f"""
+                    INSERT INTO messages ({column_sql})
+                    VALUES ({placeholders})
+                    RETURNING id, created_at
+                """,
                 tuple(insert_values)
             )
+
             row = cur.fetchone()
+
             if not row:
-                raise RuntimeError("PostgreSQL не вернул ID сообщения")
+                raise RuntimeError(
+                    "Не удалось создать сообщение"
+                )
 
             message_id = row[0]
-
-            # Получаем дату уже созданной записи, если поле есть.
-            created_at = None
-            if "created_at" in schema:
-                cur.execute('SELECT "created_at" FROM messages WHERE id = %s', (message_id,))
-                created_row = cur.fetchone()
-                if created_row:
-                    created_at = created_row[0]
+            created_at = row[1]
 
             conn.commit()
 
         except Exception as e:
             conn.rollback()
-            print("\n===================================")
+
+            print("")
+            print("===================================")
             print("SEND MESSAGE DATABASE ERROR")
             print("TYPE:", type(e).__name__)
             print("ERROR:", str(e))
             print("REPR:", repr(e))
             print("===================================")
             traceback.print_exc()
+
             raise
+
         finally:
             cur.close()
             conn.close()
 
+        # =================================================
+        # ОБЪЕКТ СООБЩЕНИЯ
+        # =================================================
+
         message = {
             "id": message_id,
             "chat_id": chat_id,
+
             "sender_id": user[0],
             "sender_username": user[1],
             "sender_display_name": user[2] or user[1],
+
             "receiver_id": receiver[0],
             "receiver_username": receiver[1],
             "receiver_display_name": receiver[2] or receiver[1],
+
             "content": content,
-            "text": content,
-            "created_at": created_at.isoformat() if created_at else None
+            "image_url": image_url or "",
+
+            "created_at": (
+                created_at.isoformat()
+                if created_at
+                else None
+            )
         }
 
-        try:
-            socketio.emit("new_message", message, room=receiver[1])
-            socketio.emit("message_sent", message, room=user[1])
-        except Exception as socket_error:
-            print("SOCKET MESSAGE ERROR:", repr(socket_error))
+        # =================================================
+        # SOCKET.IO
+        # =================================================
 
-        return jsonify({"success": True, "message": message}), 200
+        try:
+            socketio.emit(
+                "new_message",
+                message,
+                room=receiver[1]
+            )
+
+            socketio.emit(
+                "message_sent",
+                message,
+                room=user[1]
+            )
+
+        except Exception as e:
+            print("SOCKET MESSAGE ERROR:", repr(e))
+
+        return jsonify({
+            "success": True,
+            "message": message
+        }), 200
 
     except Exception as e:
-        print("\n===================================")
+        print("")
+        print("===================================")
         print("SEND MESSAGE FATAL ERROR")
         print("TYPE:", type(e).__name__)
         print("ERROR:", str(e))
@@ -1673,6 +2045,11 @@ def send_message():
             "message": "Ошибка отправки сообщения",
             "error": str(e)
         }), 500
+
+
+# =========================================================
+# MOOD GET
+# =========================================================
 
 @app.route("/api/mood", methods=["GET"])
 def get_my_mood():
