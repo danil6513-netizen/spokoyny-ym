@@ -539,10 +539,12 @@ def upload_avatar():
         avatar = image_to_data_url(request.files.get("avatar"))
         if not avatar:
             return jsonify({"success": False, "message": "Выберите фото"}), 400
-        conn = get_db(); cur = conn.cursor()
+        conn = get_db()
+        cur = conn.cursor()
         cur.execute("UPDATE users SET avatar_url = %s WHERE id = %s", (avatar, user[0]))
         conn.commit()
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
         return jsonify({"success": True, "avatar_url": avatar})
     except ValueError as e:
         return jsonify({"success": False, "message": str(e)}), 400
@@ -614,7 +616,7 @@ def set_admin_role():
 
 
 # =========================================================
-# REGISTER
+# REGISTER (БЕЗ ПРОВЕРКИ ПОЧТЫ)
 # =========================================================
 
 @app.route("/api/register", methods=["POST"])
@@ -663,12 +665,6 @@ def register():
                 "message": "Пароль минимум 6 символов"
             }), 400
 
-        if not email or "@" not in email or "." not in email.rsplit("@", 1)[-1]:
-            return jsonify({
-                "success": False,
-                "message": "Введите корректный email"
-            }), 400
-
         conn = get_db()
         cur = conn.cursor()
 
@@ -686,35 +682,19 @@ def register():
                     "message": "Такой пользователь уже существует"
                 }), 409
 
-            # Проверяем email
-            if email:
-                cur.execute("""
-                    SELECT id
-                    FROM users
-                    WHERE LOWER(email) = LOWER(%s)
-                """, (email,))
-
-                if cur.fetchone():
-                    return jsonify({
-                        "success": False,
-                        "message": "Эта почта уже используется"
-                    }), 409
-
             password_hash = bcrypt.hashpw(
                 password.encode("utf-8"),
                 bcrypt.gensalt()
             )
-            verify_token = secrets.token_urlsafe(48)
-            verify_expires = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(hours=24)
 
             cur.execute("""
                 INSERT INTO users (
                     username, password_hash, display_name, email, role,
-                    email_verified, email_verify_token, email_verify_expires
+                    email_verified
                 )
-                VALUES (%s, %s, %s, %s, 'user', FALSE, %s, %s)
+                VALUES (%s, %s, %s, %s, 'user', TRUE)
                 RETURNING id
-            """, (username, password_hash, display_name, email, verify_token, verify_expires))
+            """, (username, password_hash, display_name, email))
 
             user_id = cur.fetchone()[0]
 
@@ -728,18 +708,12 @@ def register():
             cur.close()
             conn.close()
 
-        verification_sent = send_verification_email(email, username, verify_token)
         user = get_user_by_id(user_id)
 
         return jsonify({
             "success": True,
-            "verification_required": True,
-            "verification_sent": verification_sent,
-            "message": (
-                "Аккаунт создан. Проверьте почту и перейдите по ссылке подтверждения."
-                if verification_sent else
-                "Аккаунт создан, но письмо не отправилось. Администратору нужно настроить SMTP на Render."
-            ),
+            "verification_required": False,
+            "message": "Аккаунт создан!",
             "user": user_json(user)
         })
 
@@ -801,16 +775,7 @@ def login():
                 "message": "Неверный логин или пароль"
             }), 401
 
-        # Новые аккаунты должны подтвердить email. Старые аккаунты
-        # миграция помечает подтверждёнными, чтобы не сломать вход.
         full_user = get_user_by_id(user[0])
-        if len(full_user) > 6 and not bool(full_user[6]):
-            return jsonify({
-                "success": False,
-                "verification_required": True,
-                "message": "Сначала подтвердите email. Проверьте входящие и папку Спам."
-            }), 403
-
         token = make_token(user[0])
 
         return jsonify({
@@ -1187,7 +1152,8 @@ def get_comments(post_id):
     user = get_user_by_token()
     if not user:
         return unauthorized()
-    conn = get_db(); cur = conn.cursor()
+    conn = get_db()
+    cur = conn.cursor()
     try:
         cur.execute("""
             SELECT c.id, c.user_id, u.username, u.display_name, u.avatar_url,
@@ -1204,10 +1170,12 @@ def get_comments(post_id):
             for r in cur.fetchall()
         ]})
     except Exception as e:
-        conn.rollback(); print("GET COMMENTS ERROR:", repr(e))
+        conn.rollback()
+        print("GET COMMENTS ERROR:", repr(e))
         return jsonify({"success": False, "message": "Ошибка загрузки комментариев"}), 500
     finally:
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
 
 @app.route("/api/posts/<int:post_id>/comments", methods=["POST"])
 def create_comment(post_id):
@@ -1220,7 +1188,8 @@ def create_comment(post_id):
         return jsonify({"success": False, "message": "Введите комментарий"}), 400
     if len(content) > 2000:
         return jsonify({"success": False, "message": "Комментарий слишком длинный"}), 400
-    conn = get_db(); cur = conn.cursor()
+    conn = get_db()
+    cur = conn.cursor()
     try:
         cur.execute("SELECT id FROM posts WHERE id = %s", (post_id,))
         if not cur.fetchone():
@@ -1230,7 +1199,8 @@ def create_comment(post_id):
             VALUES (%s, %s, %s)
             RETURNING id, created_at
         """, (post_id, user[0], content))
-        row = cur.fetchone(); conn.commit()
+        row = cur.fetchone()
+        conn.commit()
         return jsonify({"success": True, "comment": {
             "id": row[0], "post_id": post_id, "user_id": user[0],
             "username": user[1], "display_name": user[2] or user[1],
@@ -1238,29 +1208,35 @@ def create_comment(post_id):
             "content": content, "created_at": row[1].isoformat() if row[1] else None
         }}), 201
     except Exception as e:
-        conn.rollback(); print("CREATE COMMENT ERROR:", repr(e))
+        conn.rollback()
+        print("CREATE COMMENT ERROR:", repr(e))
         return jsonify({"success": False, "message": "Ошибка добавления комментария"}), 500
     finally:
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
 
 @app.route("/api/comments/<int:comment_id>", methods=["DELETE"])
 def delete_comment(comment_id):
     user = get_user_by_token()
     if not user:
         return unauthorized()
-    conn = get_db(); cur = conn.cursor()
+    conn = get_db()
+    cur = conn.cursor()
     try:
         cur.execute("SELECT user_id FROM comments WHERE id = %s", (comment_id,))
         row = cur.fetchone()
         if not row: return jsonify({"success": False, "message": "Комментарий не найден"}), 404
         if row[0] != user[0] and user[4] != "admin": return jsonify({"success": False, "message": "Нет прав"}), 403
-        cur.execute("DELETE FROM comments WHERE id = %s", (comment_id,)); conn.commit()
+        cur.execute("DELETE FROM comments WHERE id = %s", (comment_id,))
+        conn.commit()
         return jsonify({"success": True})
     except Exception as e:
-        conn.rollback(); print("DELETE COMMENT ERROR:", repr(e))
+        conn.rollback()
+        print("DELETE COMMENT ERROR:", repr(e))
         return jsonify({"success": False, "message": "Ошибка удаления комментария"}), 500
     finally:
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
 
 
 # =========================================================
@@ -1715,10 +1691,12 @@ def get_messages():
                 m.sender_id,
                 sender.username,
                 sender.display_name,
+                sender.avatar_url,
 
                 m.receiver_id,
                 receiver.username,
                 receiver.display_name,
+                receiver.avatar_url,
 
                 m.content,
                 m.image_url,
@@ -1762,17 +1740,19 @@ def get_messages():
                 "sender_id": r[1],
                 "sender_username": r[2],
                 "sender_display_name": r[3] or r[2],
+                "sender_avatar_url": r[4] or "",
 
-                "receiver_id": r[4],
-                "receiver_username": r[5],
-                "receiver_display_name": r[6] or r[5],
+                "receiver_id": r[5],
+                "receiver_username": r[6],
+                "receiver_display_name": r[7] or r[6],
+                "receiver_avatar_url": r[8] or "",
 
-                "content": r[7],
-                "image_url": r[8] or "",
+                "content": r[9],
+                "image_url": r[10] or "",
 
                 "created_at": (
-                    r[9].isoformat()
-                    if r[9]
+                    r[11].isoformat()
+                    if r[11]
                     else None
                 )
             })
@@ -1952,9 +1932,11 @@ def send_message():
             "sender_id": user[0],
             "sender_username": user[1],
             "sender_display_name": user[2] or user[1],
+            "sender_avatar_url": user[5] or "",
             "receiver_id": receiver[0],
             "receiver_username": receiver[1],
             "receiver_display_name": receiver[2] or receiver[1],
+            "receiver_avatar_url": receiver[5] or "",
             "content": content,
             "image_url": image_url or "",
             "created_at": created_at.isoformat() if created_at else None
