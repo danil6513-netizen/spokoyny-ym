@@ -145,6 +145,7 @@ def init_db():
                 sender_id INTEGER,
                 receiver_id INTEGER,
                 content TEXT,
+                text TEXT,
                 image_url TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -172,9 +173,6 @@ def init_db():
 
         # -----------------------------------------------------
         # БЕЗОПАСНАЯ МИГРАЦИЯ СУЩЕСТВУЮЩЕЙ БАЗЫ
-        # CREATE TABLE IF NOT EXISTS НЕ МЕНЯЕТ СТАРУЮ ТАБЛИЦУ.
-        # Поэтому добавляем недостающие поля, если они отсутствуют.
-        # Ничего не удаляем и данные пользователей не трогаем.
         # -----------------------------------------------------
 
         cur.execute("""
@@ -210,6 +208,7 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS sender_id INTEGER,
                 ADD COLUMN IF NOT EXISTS receiver_id INTEGER,
                 ADD COLUMN IF NOT EXISTS content TEXT,
+                ADD COLUMN IF NOT EXISTS text TEXT,
                 ADD COLUMN IF NOT EXISTS image_url TEXT,
                 ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         """)
@@ -232,7 +231,6 @@ def init_db():
         # ПРИНУДИТЕЛЬНОЕ НАЗНАЧЕНИЕ АДМИНА (ДЛЯ FORG)
         # =========================================================
         
-        # Сначала проверяем, есть ли пользователь Forg
         cur.execute("SELECT id, role FROM users WHERE username = 'Forg'")
         user = cur.fetchone()
         
@@ -244,7 +242,6 @@ def init_db():
                 print("✅ Forg уже админ")
         else:
             print("⚠️ Пользователь Forg не найден, создаём...")
-            # Если Forg нет в базе - создаём с временным паролем
             temp_password = bcrypt.hashpw("forg123".encode("utf-8"), bcrypt.gensalt())
             cur.execute("""
                 INSERT INTO users (username, password_hash, display_name, email, role, email_verified)
@@ -461,7 +458,6 @@ def send_verification_email(email, username, token):
         print("EMAIL VERIFICATION: SMTP не настроен")
         return False
 
-    # Ссылка ведёт прямо на API: после подтверждения сервер покажет результат.
     verify_url = f"https://spokoyny-ym.onrender.com/api/verify-email?token={quote(token)}"
     msg = EmailMessage()
     msg["Subject"] = "Подтвердите email — Спокойный ум"
@@ -669,7 +665,6 @@ def register():
         cur = conn.cursor()
 
         try:
-            # Проверяем логин
             cur.execute("""
                 SELECT id
                 FROM users
@@ -697,7 +692,6 @@ def register():
             """, (username, password_hash, display_name, email))
 
             user_id = cur.fetchone()[0]
-
             conn.commit()
 
         except Exception:
@@ -736,7 +730,6 @@ def login():
     try:
         data = request.get_json(silent=True) or {}
 
-        # Поддерживаем username/login/email
         login_value = str(
             data.get("username")
             or data.get("login")
@@ -1422,10 +1415,6 @@ def get_chats():
     cur = conn.cursor()
 
     try:
-        # Берём собеседников непосредственно из messages.
-        # Это надёжнее старой таблицы chats и автоматически
-        # показывает новый диалог после первой отправки.
-
         cur.execute("""
             SELECT
                 other_id,
@@ -1888,13 +1877,18 @@ def send_message():
                 chat_id = None
 
             columns = table_columns(cur, "messages")
-            required = {"sender_id", "receiver_id", "content"}
+            required = {"sender_id", "receiver_id"}
             missing = required - columns
             if missing:
                 raise RuntimeError("В таблице messages отсутствуют колонки: " + ", ".join(sorted(missing)))
 
             insert_columns = ["sender_id", "receiver_id", "content", "image_url"]
             insert_values = [user[0], receiver_id, content, image_url]
+
+            # Если есть колонка text, добавляем туда то же самое
+            if "text" in columns:
+                insert_columns.append("text")
+                insert_values.append(content)
 
             if "from_user" in columns:
                 insert_columns.append("from_user")
@@ -2292,8 +2286,6 @@ def socket_connect(auth=None):
 
             return False
 
-        # Каждый пользователь находится
-        # в комнате со своим username
         join_room(user[1])
 
         print(
