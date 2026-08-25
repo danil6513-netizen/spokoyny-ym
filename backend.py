@@ -11,6 +11,8 @@ import smtplib
 from email.message import EmailMessage
 from urllib.parse import quote
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit, join_room
@@ -28,6 +30,58 @@ SECRET_KEY = os.environ.get(
 )
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# =========================================================
+# AES-256-GCM ENCRYPTION
+# =========================================================
+# Render -> Environment -> ENCRYPTION_KEY
+# Ключ должен быть Base64/URL-safe Base64 и содержать ровно 32 байта.
+# Не меняй ключ после начала шифрования, иначе старые данные нельзя будет расшифровать.
+ENCRYPTION_KEY_B64 = os.environ.get("ENCRYPTION_KEY", "").strip()
+
+def load_encryption_key():
+    if not ENCRYPTION_KEY_B64:
+        raise RuntimeError(
+            "ENCRYPTION_KEY не задан. Добавь в Render Environment Variable "
+            "ENCRYPTION_KEY со случайным 32-байтным AES-256 ключом в Base64."
+        )
+    try:
+        key = base64.urlsafe_b64decode(ENCRYPTION_KEY_B64 + "=" * (-len(ENCRYPTION_KEY_B64) % 4))
+    except Exception as e:
+        raise RuntimeError("ENCRYPTION_KEY имеет неверный Base64 формат") from e
+    if len(key) != 32:
+        raise RuntimeError("ENCRYPTION_KEY должен декодироваться ровно в 32 байта")
+    return key
+
+AES_KEY = load_encryption_key()
+AES_PREFIX = "AES256GCM:v1:"
+
+def encrypt_text(value):
+    """AES-256-GCM. Для каждого значения создаётся новый случайный 96-bit nonce."""
+    if value is None:
+        return None
+    value = str(value)
+    nonce = secrets.token_bytes(12)
+    ciphertext = AESGCM(AES_KEY).encrypt(nonce, value.encode("utf-8"), None)
+    return AES_PREFIX + base64.urlsafe_b64encode(nonce + ciphertext).decode("ascii")
+
+def decrypt_text(value):
+    """Расшифровывает новые значения; старые plaintext-данные возвращает как есть."""
+    if value is None:
+        return None
+    value = str(value)
+    if not value.startswith(AES_PREFIX):
+        return value
+    try:
+        raw = base64.urlsafe_b64decode(value[len(AES_PREFIX):] + "=" * (-len(value[len(AES_PREFIX):]) % 4))
+        if len(raw) < 13:
+            raise ValueError("ciphertext too short")
+        nonce, ciphertext = raw[:12], raw[12:]
+        return AESGCM(AES_KEY).decrypt(nonce, ciphertext, None).decode("utf-8")
+    except Exception as e:
+        print("AES DECRYPT ERROR:", repr(e))
+        return "[Зашифрованное сообщение недоступно]"
+
 
 # SMTP для подтверждения email. На Render задай эти переменные:
 # SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM, SMTP_TLS=true
@@ -1736,8 +1790,8 @@ def get_messages():
                 "receiver_display_name": r[7] or r[6],
                 "receiver_avatar_url": r[8] or "",
 
-                "content": r[9],
-                "image_url": r[10] or "",
+                "content": decrypt_text(r[9]) or "",
+                "image_url": decrypt_text(r[10]) or "",
 
                 "created_at": (
                     r[11].isoformat()
@@ -1882,13 +1936,18 @@ def send_message():
             if missing:
                 raise RuntimeError("В таблице messages отсутствуют колонки: " + ", ".join(sorted(missing)))
 
+            # Шифруем данные ДО записи в PostgreSQL.
+            # В БД content/image_url будут выглядеть как AES256GCM:v1:...
+            encrypted_content = encrypt_text(content) if content else None
+            encrypted_image_url = encrypt_text(image_url) if image_url else None
+
             insert_columns = ["sender_id", "receiver_id", "content", "image_url"]
-            insert_values = [user[0], receiver_id, content, image_url]
+            insert_values = [user[0], receiver_id, encrypted_content, encrypted_image_url]
 
             # Если есть колонка text, добавляем туда то же самое
             if "text" in columns:
                 insert_columns.append("text")
-                insert_values.append(content)
+                insert_values.append(encrypted_content)
 
             if "from_user" in columns:
                 insert_columns.append("from_user")
@@ -2376,6 +2435,8 @@ def health():
 # START
 # =========================================================
 
+print("===================================")
+print("AES-256-GCM: ВКЛЮЧЕНО")
 print("===================================")
 print("ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ")
 print("===================================")
